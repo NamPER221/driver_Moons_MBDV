@@ -31,7 +31,22 @@ bool DualAxisController::Initialize(const std::string& can_interface,
   loop_ = std::make_unique<lely::ev::Loop>(poll_->get_poll());
   auto exec = loop_->get_executor();
   timer_ = std::make_unique<lely::io::Timer>(*poll_, exec, CLOCK_MONOTONIC);
-  ctrl_ = std::make_unique<lely::io::CanController>(can_interface.c_str());
+
+  try {
+    // Pass txlen = 1 to avoid requiring CAP_NET_ADMIN / root permissions
+    ctrl_ = std::make_unique<lely::io::CanController>(can_interface.c_str(), 1);
+  } catch (const std::exception& ex) {
+    try {
+      ctrl_ = std::make_unique<lely::io::CanController>(can_interface.c_str());
+    } catch (const std::exception& e2) {
+      std::cerr << "ERROR: Failed to initialize CAN controller for '" << can_interface
+                << "': " << e2.what()
+                << "\n[HINT]: Run with 'sudo' or configure txqueuelen: 'sudo ip link set "
+                << can_interface << " txqueuelen 1000'" << std::endl;
+      return false;
+    }
+  }
+
   chan_ = std::make_unique<lely::io::CanChannel>(*poll_, exec);
 
   try {
