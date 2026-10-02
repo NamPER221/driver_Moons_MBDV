@@ -1,0 +1,44 @@
+master:
+  node_id: 127
+  baudrate: 500 # 500 kbps (500k)
+  sync_period: 10000 # 10 ms (10000 us)
+  heartbeat_multiplier: 1.5
+
+slave_1:
+  dcf: config/single_axis_500k/CANOPEN-EDS-MBDV-Servo-DulAxes-V1.0.eds
+  node_id: 1 # Axis 1 Node ID = 1
+  boot: true
+  mandatory: true
+  rpdo:
+    1:
+      enabled: true
+      cob_id: auto
+      mapping:
+        - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
+        - { index: 0x6060, sub_index: 0 } # Modes of operation (8-bit)
+    2:
+      enabled: true
+      cob_id: auto
+      mapping:
+        - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
+        - { index: 0x607A, sub_index: 0 } # Target position (32-bit)
+    3:
+      enabled: true
+      cob_id: auto
+      mapping:
+        - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
+        - { index: 0x60FF, sub_index: 0 } # Target velocity (32-bit)
+  tpdo:
+    1:
+      enabled: true
+      cob_id: auto
+      event_timer: 10 # 10 ms cyclic transmission
+      mapping:
+        - { index: 0x6041, sub_index: 0 } # Statusword (16-bit)
+    2:
+      enabled: true
+      cob_id: auto
+      event_timer: 10 # 10 ms cyclic transmission
+      mapping:
+        - { index: 0x6064, sub_index: 0 } # Position actual value (32-bit)
+        - { index: 0x606C, sub_index: 0 } # Velocity actual value (32-bit)

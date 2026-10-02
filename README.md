@@ -116,7 +116,47 @@ sudo ip link set can0 up
 ./build/mbdv_dual_axis_node -i can0 -d config/master.dcf -1 1 -2 2
 ```
 
-### 4.4 Chạy chế độ kiểm tra kích hoạt Servo ON và điều khiển chuyển động đồng thời 2 trục
+### 4.4 Chạy chế độ kiểm tra kích hoạt Servo ON và điều khiển chuyển động đồng thời 2 trục (1 Mbps)
 ```bash
 ./build/mbdv_dual_axis_node -i can0 -d config/master.dcf -1 1 -2 2 --test-motion
 ```
+
+---
+
+## 5. Phiên bản Điều khiển Độc lập Trục 1 (Node ID 1, Baudrate 500k)
+
+Dự án cung cấp cấu hình và chương trình thực thi riêng `mbdv_single_axis_node` chuyên biệt để điều khiển Trục 1 độc lập ở tốc độ bus **500 kbps (500k)**.
+
+### 5.1 Cấu hình DIP Switch Phần cứng cho Trục 1 @ 500k
+Theo tài liệu phần cứng Moons' MBDV-2X (*Hardware Manual - Mục 4.2.2*):
+* **Node ID Trục 1 = 1**:
+  * `SW1 = 1`, `SW2 = 0`, `SW3 = 0`
+* **Tốc độ Baudrate = 500 kbps**:
+  * `SW7 = 1` (Bật công tắc SW7 lên ON để chuyển sang 500 kbps; nếu SW7 = 0 sẽ là 1 Mbps mặc định bởi Luna).
+* **Trở đầu cuối (Terminal Resistor 120 Ω)**:
+  * `SW8 = 1` (nếu driver nằm ở điểm cuối của bus CAN).
+
+### 5.2 Thiết lập SocketCAN ở tốc độ 500 kbps
+```bash
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 500000
+sudo ip link set can0 up
+```
+
+### 5.3 Chạy giám sát trạng thái Trục 1 (Telemetry Monitor)
+```bash
+./build/mbdv_single_axis_node -i can0 -d config/single_axis_500k/master.dcf -1 1
+```
+
+### 5.4 Chạy kiểm tra vị trí Trục 1 (Profile Position Mode)
+Tự động kích hoạt Servo ON, chạy tới +10000 counts, hồi về 0 counts và ngắt servo an toàn:
+```bash
+./build/mbdv_single_axis_node -i can0 -d config/single_axis_500k/master.dcf -1 1 --test-motion
+```
+
+### 5.5 Chạy kiểm tra vận tốc Trục 1 (Profile Velocity Mode)
+Ví dụ đặt tốc độ 5000 counts/s trong 4 giây:
+```bash
+./build/mbdv_single_axis_node -i can0 -d config/single_axis_500k/master.dcf -1 1 --test-velocity 5000
+```
+
