@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+bin/
+lib/
+*.o
+*.so
+*.a
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs
+*.log
