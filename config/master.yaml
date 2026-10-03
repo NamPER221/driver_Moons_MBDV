@@ -1,7 +1,36 @@
+# CANopen master configuration for the Moons' MBDV-2X-520AC dual-axis servo drive.
+#
+# Generated DCF/BIN with:
+#   dcfgen -r -d config config/master.yaml
+#
+# NOTE on transmission types
+# ------------------------
+# The drive ships 0x1401:02 and 0x1402:02 (RPDO2 / RPDO3 transmission type) with the
+# value 0xFE. The low two bits of a CiA 301 transmission type select the trigger mode,
+# and 0xFE = 0b1111_1110 has low bits 10b == "RTR only". An RPDO left in that mode
+# silently discards normally-transmitted frames, so target position / target velocity
+# commands would never be acted upon.
+#
+# Every PDO below therefore sets `transmission: 255` (0xFF, low bits 11b == event
+# driven), which is also the value the drive itself uses for RPDO1 and the TPDOs.
+#
+# The C++ driver additionally programs and verifies the whole PDO layout at runtime in
+# stage S09, so a wrong value here cannot silently break motion control: S09 fails and
+# names the exact object and sub-index.
+#
+# dcfgen caveat (verified with `dcfgen -r -v`)
+# ------------------------------------------
+# dcfgen emits, as the last write to each 0x140x:01 / 0x180x:01, the COB-ID with bit 31
+# CLEAR, which means "PDO disabled", even when the YAML says `enabled: true`. The flag is
+# therefore inverted in the generated .bin. The YAML still usefully defines the mapping and
+# the transmission type, and stage S09 of the driver re-enables each PDO (bit 31 set) and
+# disables the unused RPDO4 / TPDO4 at runtime, so the final state on the drive is correct
+# regardless of what dcfgen produced.
+
 master:
   node_id: 127
-  baudrate: 1000
-  sync_period: 10000 # 10 ms (10000 us)
+  baudrate: 500 # 500 kbps (MBDV DIP SW7 = 1)
+  sync_period: 10000 # 10 ms
   heartbeat_multiplier: 1.5
 
 slave_1:
@@ -9,39 +38,54 @@ slave_1:
   node_id: 1
   boot: true
   mandatory: true
+  # ---- RPDO: master -> drive ----
   rpdo:
-    1:
+    1:                              # COB-ID 0x200 + node
       enabled: true
       cob_id: auto
+      transmission: 255             # 0xFF event driven (drive default)
       mapping:
         - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
         - { index: 0x6060, sub_index: 0 } # Modes of operation (8-bit)
-    2:
+    2:                              # COB-ID 0x300 + node
       enabled: true
       cob_id: auto
+      transmission: 255             # CRITICAL: drive default is 0xFE (RTR only)
       mapping:
         - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
         - { index: 0x607A, sub_index: 0 } # Target position (32-bit)
-    3:
+    3:                              # COB-ID 0x400 + node
       enabled: true
       cob_id: auto
+      transmission: 255             # CRITICAL: drive default is 0xFE (RTR only)
       mapping:
         - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
         - { index: 0x60FF, sub_index: 0 } # Target velocity (32-bit)
+  # ---- TPDO: drive -> master ----
   tpdo:
-    1:
+    1:                              # COB-ID 0x180 + node, 10 ms cyclic Statusword
       enabled: true
       cob_id: auto
-      event_timer: 10 # 10 ms cyclic transmission
+      transmission: 255
+      event_timer: 10
       mapping:
         - { index: 0x6041, sub_index: 0 } # Statusword (16-bit)
-    2:
+    2:                              # COB-ID 0x280 + node, 10 ms position + velocity
       enabled: true
       cob_id: auto
-      event_timer: 10 # 10 ms cyclic transmission
+      transmission: 255
+      event_timer: 10
       mapping:
         - { index: 0x6064, sub_index: 0 } # Position actual value (32-bit)
         - { index: 0x606C, sub_index: 0 } # Velocity actual value (32-bit)
+    3:                              # COB-ID 0x380 + node, 100 ms live fault diagnosis
+      enabled: true
+      cob_id: auto
+      transmission: 255
+      event_timer: 100
+      mapping:
+        - { index: 0x603F, sub_index: 0 } # CiA 402 error code (16-bit)
+        - { index: 0x200F, sub_index: 0 } # DSP alarm code (32-bit)
 
 slave_2:
   dcf: config/CANOPEN-EDS-MBDV-Servo-DulAxes-V1.0.eds
@@ -52,32 +96,48 @@ slave_2:
     1:
       enabled: true
       cob_id: auto
+      transmission: 255
       mapping:
-        - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
-        - { index: 0x6060, sub_index: 0 } # Modes of operation (8-bit)
+        - { index: 0x6040, sub_index: 0 }
+        - { index: 0x6060, sub_index: 0 }
     2:
       enabled: true
       cob_id: auto
+      transmission: 255             # CRITICAL: drive default is 0xFE (RTR only)
       mapping:
-        - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
-        - { index: 0x607A, sub_index: 0 } # Target position (32-bit)
+        - { index: 0x6040, sub_index: 0 }
+        - { index: 0x607A, sub_index: 0 }
     3:
       enabled: true
       cob_id: auto
+      transmission: 255             # CRITICAL: drive default is 0xFE (RTR only)
       mapping:
-        - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
-        - { index: 0x60FF, sub_index: 0 } # Target velocity (32-bit)
+        - { index: 0x6040, sub_index: 0 }
+        - { index: 0x60FF, sub_index: 0 }
   tpdo:
     1:
       enabled: true
       cob_id: auto
+      transmission: 255
       event_timer: 10
       mapping:
-        - { index: 0x6041, sub_index: 0 } # Statusword (16-bit)
+        - { index: 0x6041, sub_index: 0 }
     2:
       enabled: true
       cob_id: auto
+      transmission: 255
       event_timer: 10
       mapping:
-        - { index: 0x6064, sub_index: 0 } # Position actual value (32-bit)
-        - { index: 0x606C, sub_index: 0 } # Velocity actual value (32-bit)
+        - { index: 0x6064, sub_index: 0 }
+        - { index: 0x606C, sub_index: 0 }
+    3:
+      enabled: true
+      cob_id: auto
+      transmission: 255
+      event_timer: 100
+      mapping:
+        - { index: 0x603F, sub_index: 0 }
+        - { index: 0x200F, sub_index: 0 }
+    4:
+      enabled: false
+      cob_id: auto

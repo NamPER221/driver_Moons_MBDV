@@ -2,12 +2,12 @@
 
 #include "mbdv/mbdv_axis_driver.hpp"
 
+#include <lely/coapp/master.hpp>
 #include <lely/ev/loop.hpp>
 #include <lely/io2/linux/can.hpp>
 #include <lely/io2/posix/poll.hpp>
 #include <lely/io2/sys/io.hpp>
 #include <lely/io2/sys/timer.hpp>
-#include <lely/coapp/master.hpp>
 
 #include <atomic>
 #include <memory>
@@ -16,89 +16,83 @@
 
 namespace mbdv {
 
+struct SingleAxisOptions {
+  std::string can_interface{"can0"};
+  std::string dcf_path{"config/single_axis_500k/master.dcf"};
+  std::string bin_path;
+  uint8_t node_id{1};
+  uint32_t expect_bitrate_bps{500000};
+  uint32_t expect_control_mode{static_cast<uint32_t>(DriveControlMode::kPositionControl)};
+  /// When non-zero, S08 writes this value to 0x2A30 (P1-00) before checking it.
+  uint32_t write_control_mode{0};
+  /// Warn in S08 when Statusword bit 4 reports the main voltage absent.
+  bool check_dc_bus{true};
+  /// Retry a failed Controlword over SDO. Disable to test the RPDO path in isolation.
+  bool sdo_controlword_fallback{true};
+  /// Send setpoints over SDO instead of RPDO (drives that ignore received RPDOs).
+  bool sdo_setpoints{false};
+  /// 0x2060 communication watchdog: -1 untouched, 0 disabled, >0 timeout in ms.
+  int32_t watchdog_timeout_ms{-1};
+  /// Persist a --p1-00 change with 0x1010:01 = 1 (opt-in, see README).
+  bool store_parameters{false};
+  CiA402Mode mode{CiA402Mode::PROFILE_POSITION};
+  PdoPlan pdo{};
+  std::chrono::milliseconds boot_timeout{3000};
+  std::chrono::milliseconds servo_timeout{2000};
+  LogLevel log_level{LogLevel::INFO};
+  std::string log_file;
+  bool colour{true};
+  int32_t step_counts{10000};
+  int32_t test_velocity{5000};
+};
+
 /**
- * @brief Controller for single axis (Axis 1, Node ID 1) of Moons' MBDV Servo Drive.
- * Designed for 500 kbps baudrate CANopen network.
+ * @brief Single-axis (Axis 1) controller for the Moons' MBDV servo drive.
+ *
+ * Same staged bring-up as DualAxisController, restricted to one node. Kept so a
+ * single channel can be commissioned before both axes share the bus.
  */
 class SingleAxisController {
  public:
   SingleAxisController();
   ~SingleAxisController();
 
-  // Non-copyable, non-movable
   SingleAxisController(const SingleAxisController&) = delete;
   SingleAxisController& operator=(const SingleAxisController&) = delete;
 
-  /**
-   * @brief Initializes CAN channel, AsyncMaster, and Axis 1 Driver.
-   * @param can_interface SocketCAN interface name (e.g. "can0").
-   * @param dcf_path Path to master.dcf file (e.g. "config/single_axis_500k/master.dcf").
-   * @param bin_path Optional path to master.bin file.
-   * @param node_id CANopen Node ID for Axis 1 (default 1).
-   */
-  bool Initialize(const std::string& can_interface, const std::string& dcf_path,
-                  const std::string& bin_path = "", uint8_t node_id = 1);
+  bool Initialize(const SingleAxisOptions& options, DiagnosticReport& report);
+  bool Start(DiagnosticReport& report);
 
-  /**
-   * @brief Starts the CANopen master event loop in a dedicated thread.
-   */
-  void Start();
+  /// Stages S05..S11 for the single node.
+  bool BringUp(DiagnosticReport& report,
+             const SingleAxisOptions& bring_up_options = SingleAxisOptions{});
 
-  /**
-   * @brief Stops the master, disables servo, and cleans up resources.
-   */
+  bool SetMode(DiagnosticReport& report, CiA402Mode mode);
+  bool EnableServo(DiagnosticReport& report, std::chrono::milliseconds timeout);
+  bool DisableServo(DiagnosticReport& report);
+  /// Starts the continuous 0x200F / 0x1001 alarm watch.
+  void StartAlarmWatch(std::chrono::milliseconds period);
+  void StopAlarmWatch();
+
   void Stop();
 
-  /**
-   * @brief Commands Servo ON sequence (Shutdown -> Switch ON -> Enable Operation).
-   * @return true if drive reached OPERATION_ENABLED.
-   */
-  bool EnableServo(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000));
+  bool MoveToPositionStaged(DiagnosticReport& report, int32_t target,
+                            std::chrono::milliseconds timeout);
+  bool SetVelocityStaged(DiagnosticReport& report, int32_t target,
+                         std::chrono::milliseconds settle);
 
-  /**
-   * @brief Disables servo (Servo OFF).
-   */
-  bool DisableServo();
-
-  /**
-   * @brief Resets drive fault.
-   */
-  void ResetFault();
-
-  /**
-   * @brief Commands quick stop.
-   */
-  void QuickStop();
-
-  /**
-   * @brief Sets CiA 402 operation mode (e.g. Profile Position or Profile Velocity).
-   */
-  void SetMode(CiA402Mode mode);
-
-  /**
-   * @brief Commands position motion in Profile Position (PP) mode.
-   * @param target_position Target position in encoder counts (Object 0x607A).
-   * @param relative If true, position is relative to current position.
-   */
-  void MoveToPosition(int32_t target_position, bool relative = false);
-
-  /**
-   * @brief Commands target velocity in Profile Velocity (PV) mode.
-   * @param target_velocity Target velocity in counts/s (Object 0x60FF).
-   */
-  void SetTargetVelocity(int32_t target_velocity);
-
-  /**
-   * @brief Prints real-time status telemetry of Axis 1.
-   */
   void PrintTelemetry() const;
+  void PrintDriveDiagnostics() const;
 
-  // Accessors
   MbdvAxisDriver& GetAxis() { return *axis_; }
   const MbdvAxisDriver& GetAxis() const { return *axis_; }
+
   bool IsRunning() const noexcept { return is_running_.load(); }
+  const SingleAxisOptions& Options() const noexcept { return options_; }
 
  private:
+  SingleAxisOptions options_;
+
   std::unique_ptr<lely::io::IoGuard> io_guard_;
   std::unique_ptr<lely::io::Context> ctx_;
   std::unique_ptr<lely::io::Poll> poll_;
@@ -110,6 +104,7 @@ class SingleAxisController {
 
   std::unique_ptr<MbdvAxisDriver> axis_;
 
+  std::string original_cwd_;  ///< restored by Stop(); see config_path.hpp
   std::thread loop_thread_;
   std::atomic<bool> is_running_{false};
 };

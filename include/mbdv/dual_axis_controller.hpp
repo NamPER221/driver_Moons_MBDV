@@ -1,102 +1,121 @@
 #pragma once
 
-#include "mbdv/mbdv_axis_driver.hpp"
 #include "mbdv/diff_drive_kinematics.hpp"
+#include "mbdv/mbdv_axis_driver.hpp"
 
+#include <lely/coapp/master.hpp>
 #include <lely/ev/loop.hpp>
 #include <lely/io2/linux/can.hpp>
 #include <lely/io2/posix/poll.hpp>
 #include <lely/io2/sys/io.hpp>
 #include <lely/io2/sys/timer.hpp>
-#include <lely/coapp/master.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
-#include <atomic>
 
 namespace mbdv {
 
 /**
- * @brief Coordinates dual-axis control for Moons' MBDV Servo Drive.
+ * @brief Everything the dual-axis master needs, in one place.
+ */
+struct ControllerOptions {
+  // --- bus ---
+  std::string can_interface{"can0"};
+  std::string dcf_path{"config/master.dcf"};
+  std::string bin_path;  ///< empty -> only the DCF is used
+
+  // --- nodes ---
+  uint8_t axis1_node_id{1};
+  uint8_t axis2_node_id{2};
+
+  // --- expectations checked in stage S08 (0 -> skip that check) ---
+  uint32_t expect_bitrate_bps{500000};
+  uint32_t expect_control_mode{static_cast<uint32_t>(DriveControlMode::kPositionControl)};
+  /// When non-zero, S08 writes this value to 0x2A30 (P1-00) before checking it.
+  uint32_t write_control_mode{0};
+  /// Warn in S08 when Statusword bit 4 reports the main voltage absent.
+  bool check_dc_bus{true};
+  /// Retry a failed Controlword over SDO. Disable to test the RPDO path in isolation.
+  bool sdo_controlword_fallback{true};
+  /// Send setpoints over SDO instead of RPDO (drives that ignore received RPDOs).
+  bool sdo_setpoints{false};
+  /// 0x2060 communication watchdog: -1 untouched, 0 disabled, >0 timeout in ms.
+  int32_t watchdog_timeout_ms{-1};
+  /// Persist a --p1-00 change with 0x1010:01 = 1 (opt-in, see README).
+  bool store_parameters{false};
+
+  // --- behaviour ---
+  CiA402Mode mode{CiA402Mode::PROFILE_POSITION};
+  PdoPlan pdo{};
+  std::chrono::milliseconds boot_timeout{3000};
+  std::chrono::milliseconds servo_timeout{2000};
+
+  // --- logging ---
+  LogLevel log_level{LogLevel::INFO};
+  std::string log_file;  ///< empty -> console only
+  bool colour{true};
+
+  // --- test script ---
+  int32_t step_counts{10000};   ///< position-test stroke in encoder counts
+  int32_t test_velocity{5000};  ///< velocity-test setpoint in counts/s
+};
+
+/**
+ * @brief Coordinates dual-axis control of the Moons' MBDV-2X-520AC servo drive.
  *
- * Manages the Lely CANopen Master, event loop execution thread, and both
- * Axis 1 (Node 1) and Axis 2 (Node 2) instances.
+ * Owns the lely CANopen master, the event-loop thread and the two axis drivers.
+ * Every lifecycle step is a numbered Stage and is recorded in a DiagnosticReport
+ * so a failure can be traced to exactly one step.
  */
 class DualAxisController {
  public:
   DualAxisController();
   ~DualAxisController();
 
-  // Non-copyable, non-movable
   DualAxisController(const DualAxisController&) = delete;
   DualAxisController& operator=(const DualAxisController&) = delete;
 
   /**
-   * @brief Initializes CAN channel, AsyncMaster, and Axis Drivers.
-   * @param can_interface SocketCAN interface (e.g. "can0", "vcan0").
-   * @param dcf_path Path to master.dcf file.
-   * @param bin_path Optional path to master.bin file.
-   * @param axis1_node_id Node ID for Axis 1 (default 1).
-   * @param axis2_node_id Node ID for Axis 2 (default 2).
+   * @brief Stages S01..S03: configure logging, open the CAN link, load the DCF.
+   * @return true when all three stages passed.
    */
-  bool Initialize(const std::string& can_interface, const std::string& dcf_path,
-                  const std::string& bin_path = "", uint8_t axis1_node_id = 1,
-                  uint8_t axis2_node_id = 2);
+  bool Initialize(const ControllerOptions& options, DiagnosticReport& report);
 
-  /**
-   * @brief Starts the CANopen master event loop in a dedicated thread.
-   */
-  void Start();
+  /** Stage S04: start the event-loop thread and post master Reset. */
+  bool Start(DiagnosticReport& report);
 
-  /**
-   * @brief Stops the master, disables drives, and cleans up resources.
-   */
+  /** Stages S05..S11 for both axes, then a summary. */
+  bool BringUpBothAxes(DiagnosticReport& report,
+                       const ControllerOptions& bring_up_options = ControllerOptions{});
+
+  /** Stage S10 for both axes. */
+  bool SetModeBothAxes(DiagnosticReport& report, CiA402Mode mode);
+
+  /** Stage S12 for both axes. */
+  bool EnableBothAxes(DiagnosticReport& report, std::chrono::milliseconds timeout);
+
+  /** Stage S15 for both axes. */
+  void DisableBothAxes(DiagnosticReport& report);
+
+  /** Stages S16 + S02 teardown. */
+  /// Starts the continuous 0x200F / 0x1001 alarm watch on both axes.
+  void StartAlarmWatch(std::chrono::milliseconds period);
+  void StopAlarmWatch();
+
   void Stop();
 
-  /**
-   * @brief Simultaneously commands Servo ON for both axes.
-   * @return true if both axes reached OPERATION_ENABLED.
-   */
-  bool EnableBothAxes(std::chrono::milliseconds timeout = std::chrono::milliseconds(3000));
-
-  /**
-   * @brief Disables both axes (Servo OFF).
-   */
-  void DisableBothAxes();
-
-  /**
-   * @brief Sends simultaneous position setpoints to both axes.
-   * @param pos1 Target position for Axis 1.
-   * @param pos2 Target position for Axis 2.
-   * @param relative If true, target position is relative to current setpoint.
-   */
+  // --- motion helpers (unstaged, used by the interactive monitor) ---
   void MoveBothAxes(int32_t pos1, int32_t pos2, bool relative = false);
-
-  /**
-   * @brief Sends simultaneous velocity setpoints to both axes.
-   * @param vel1 Target velocity for Axis 1.
-   * @param vel2 Target velocity for Axis 2.
-   */
   void SetBothVelocities(int32_t vel1, int32_t vel2);
-
-  /**
-   * @brief Sets operation mode for both axes (e.g. Profile Position or Profile Velocity).
-   */
-  void SetModeBothAxes(CiA402Mode mode);
-
-  /**
-   * @brief Kinematic Control: Sets robot cmd_vel (v, w) using differential drive inverse kinematics.
-   * Converts linear and angular velocity to left/right wheel driver speeds (0x60FF) and transmits via RPDO3.
-   * @param linear_v Linear velocity in m/s.
-   * @param angular_w Angular velocity in rad/s.
-   */
   void SetCmdVel(double linear_v, double angular_w);
+  bool MoveBothAxesStaged(DiagnosticReport& report, int32_t pos1, int32_t pos2,
+                          std::chrono::milliseconds timeout);
+  bool SetVelocitiesStaged(DiagnosticReport& report, int32_t vel1, int32_t vel2,
+                           std::chrono::milliseconds settle);
 
-  /**
-   * @brief Kinematic Odometry: Updates robot odometry pose (x, y, theta) from encoder feedback (0x6064).
-   * @param dt_sec Elapsed time interval in seconds.
-   */
   void UpdateOdometry(double dt_sec);
 
   RobotPose GetRobotPose() const { return kinematics_.GetPose(); }
@@ -108,21 +127,23 @@ class DualAxisController {
   DiffDriveKinematics& GetKinematics() noexcept { return kinematics_; }
   const DiffDriveKinematics& GetKinematics() const noexcept { return kinematics_; }
 
-  /**
-   * @brief Prints formatted real-time status of both axes and integrated odometry.
-   */
+  /** Prints a two-axis telemetry table plus the integrated odometry. */
   void PrintTelemetry() const;
 
-  // Accessors
+  /** Prints every diagnostic object of both axes (blocking SDO reads). */
+  void PrintDriveDiagnostics() const;
+
   MbdvAxisDriver& GetAxis1() { return *axis1_; }
   const MbdvAxisDriver& GetAxis1() const { return *axis1_; }
-
   MbdvAxisDriver& GetAxis2() { return *axis2_; }
   const MbdvAxisDriver& GetAxis2() const { return *axis2_; }
 
   bool IsRunning() const noexcept { return is_running_.load(); }
+  const ControllerOptions& Options() const noexcept { return options_; }
 
  private:
+  ControllerOptions options_;
+
   std::unique_ptr<lely::io::IoGuard> io_guard_;
   std::unique_ptr<lely::io::Context> ctx_;
   std::unique_ptr<lely::io::Poll> poll_;
@@ -137,6 +158,7 @@ class DualAxisController {
 
   DiffDriveKinematics kinematics_;
 
+  std::string original_cwd_;  ///< restored by Stop(); see config_path.hpp
   std::thread loop_thread_;
   std::atomic<bool> is_running_{false};
 };

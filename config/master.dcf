@@ -2,7 +2,7 @@
 NodeID=127
 NodeName=
 NodeRefd=
-Baudrate=1000
+Baudrate=500
 NetNumber=1
 NetworkName=
 NetRefd=
@@ -119,51 +119,53 @@ SupportedObjects=57
 57=0x1F8A
 
 [ManufacturerObjects]
-SupportedObjects=44
+SupportedObjects=46
 1=0x2000
 2=0x2001
-3=0x2004
-4=0x2005
-5=0x2200
-6=0x2201
-7=0x2202
-8=0x2203
-9=0x2204
-10=0x2205
-11=0x2206
-12=0x2207
-13=0x5800
-14=0x5801
-15=0x5802
-16=0x5803
-17=0x5804
-18=0x5805
-19=0x5806
-20=0x5807
-21=0x5A00
-22=0x5A01
-23=0x5A02
-24=0x5A03
-25=0x5A04
-26=0x5A05
-27=0x5A06
-28=0x5A07
-29=0x5C00
-30=0x5C01
-31=0x5C02
-32=0x5C03
-33=0x5C04
-34=0x5C05
-35=0x5C06
-36=0x5C07
-37=0x5E00
-38=0x5E01
-39=0x5E02
-40=0x5E03
-41=0x5E04
-42=0x5E05
-43=0x5E06
-44=0x5E07
+3=0x2002
+4=0x2004
+5=0x2005
+6=0x2006
+7=0x2200
+8=0x2201
+9=0x2202
+10=0x2203
+11=0x2204
+12=0x2205
+13=0x2206
+14=0x2207
+15=0x5800
+16=0x5801
+17=0x5802
+18=0x5803
+19=0x5804
+20=0x5805
+21=0x5806
+22=0x5807
+23=0x5A00
+24=0x5A01
+25=0x5A02
+26=0x5A03
+27=0x5A04
+28=0x5A05
+29=0x5A06
+30=0x5A07
+31=0x5C00
+32=0x5C01
+33=0x5C02
+34=0x5C03
+35=0x5C04
+36=0x5C05
+37=0x5C06
+38=0x5C07
+39=0x5E00
+40=0x5E01
+41=0x5E02
+42=0x5E03
+43=0x5E04
+44=0x5E05
+45=0x5E06
+46=0x5E07
 
 [1000]
 ParameterName=Device type
@@ -641,11 +643,12 @@ ParameterName=RPDO mapping parameter
 ObjectType=0x09
 DataType=0x0007
 AccessType=rw
-CompactSubObj=1
+CompactSubObj=2
 
 [1602Value]
-NrOfEntries=1
-1=0x20010220
+NrOfEntries=2
+1=0x20020110
+2=0x20020220
 
 [1603]
 ParameterName=RPDO mapping parameter
@@ -687,11 +690,12 @@ ParameterName=RPDO mapping parameter
 ObjectType=0x09
 DataType=0x0007
 AccessType=rw
-CompactSubObj=1
+CompactSubObj=2
 
 [1606Value]
-NrOfEntries=1
-1=0x20050220
+NrOfEntries=2
+1=0x20060110
+2=0x20060220
 
 [1607]
 ParameterName=RPDO mapping parameter
@@ -772,7 +776,7 @@ DefaultValue=0x00000301
 ParameterName=transmission type
 DataType=0x0005
 AccessType=rw
-DefaultValue=0xFE
+DefaultValue=0xFF
 
 [1801sub3]
 ParameterName=inhibit time
@@ -818,7 +822,7 @@ DefaultValue=0x00000401
 ParameterName=transmission type
 DataType=0x0005
 AccessType=rw
-DefaultValue=0xFE
+DefaultValue=0xFF
 
 [1802sub3]
 ParameterName=inhibit time
@@ -956,7 +960,7 @@ DefaultValue=0x00000302
 ParameterName=transmission type
 DataType=0x0005
 AccessType=rw
-DefaultValue=0xFE
+DefaultValue=0xFF
 
 [1805sub3]
 ParameterName=inhibit time
@@ -1002,7 +1006,7 @@ DefaultValue=0x00000402
 ParameterName=transmission type
 DataType=0x0005
 AccessType=rw
-DefaultValue=0xFE
+DefaultValue=0xFF
 
 [1806sub3]
 ParameterName=inhibit time
@@ -1958,6 +1962,29 @@ DataType=0x0004
 AccessType=rww
 PDOMapping=1
 
+[2002]
+SubNumber=3
+ParameterName=Mapped application objects for RPDO 3
+ObjectType=0x09
+
+[2002sub0]
+ParameterName=Highest sub-index supported
+DataType=0x0005
+AccessType=const
+DefaultValue=2
+
+[2002sub1]
+ParameterName=slave_1: Error code
+DataType=0x0006
+AccessType=rww
+PDOMapping=1
+
+[2002sub2]
+ParameterName=slave_1: DSP alarm code
+DataType=0x0007
+AccessType=rww
+PDOMapping=1
+
 [2004]
 SubNumber=2
 ParameterName=Mapped application objects for RPDO 5
@@ -1995,6 +2022,29 @@ PDOMapping=1
 [2005sub2]
 ParameterName=slave_2: Velocity value calculated
 DataType=0x0004
+AccessType=rww
+PDOMapping=1
+
+[2006]
+SubNumber=3
+ParameterName=Mapped application objects for RPDO 7
+ObjectType=0x09
+
+[2006sub0]
+ParameterName=Highest sub-index supported
+DataType=0x0005
+AccessType=const
+DefaultValue=2
+
+[2006sub1]
+ParameterName=slave_2: Error code
+DataType=0x0006
+AccessType=rww
+PDOMapping=1
+
+[2006sub2]
+ParameterName=slave_2: DSP alarm code
+DataType=0x0007
 AccessType=rww
 PDOMapping=1
 
@@ -2222,11 +2272,12 @@ ParameterName=Remote TPDO mapping parameter
 ObjectType=0x08
 DataType=0x0007
 AccessType=rw
-CompactSubObj=1
+CompactSubObj=2
 
 [5A02Value]
-NrOfEntries=1
-1=0x606C0020
+NrOfEntries=2
+1=0x603F0010
+2=0x200F0020
 
 [5A03]
 ParameterName=Remote TPDO mapping parameter
@@ -2268,11 +2319,12 @@ ParameterName=Remote TPDO mapping parameter
 ObjectType=0x08
 DataType=0x0007
 AccessType=rw
-CompactSubObj=1
+CompactSubObj=2
 
 [5A06Value]
-NrOfEntries=1
-1=0x606C0020
+NrOfEntries=2
+1=0x603F0010
+2=0x200F0020
 
 [5A07]
 ParameterName=Remote TPDO mapping parameter
