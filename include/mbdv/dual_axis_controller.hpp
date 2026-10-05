@@ -161,6 +161,9 @@ class DualAxisController {
   std::string original_cwd_;  ///< restored by Stop(); see config_path.hpp
   std::thread loop_thread_;
   std::atomic<bool> is_running_{false};
+
+  double last_cmd_v_{-999.0};
+  double last_cmd_w_{-999.0};
 };
 
 }  // namespace mbdv

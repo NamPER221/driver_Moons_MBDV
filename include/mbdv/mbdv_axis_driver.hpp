@@ -333,6 +333,7 @@ class MbdvAxisDriver : public lely::canopen::FiberDriver {
   std::atomic<uint32_t> watched_alarm_{0xFFFFFFFFu};
   std::atomic<uint32_t> watched_error_reg_{0xFFFFFFFFu};
   std::atomic<bool> sdo_setpoints_{false};
+  std::atomic<int32_t> last_target_velocity_{0x7FFFFFFF};
   bool store_parameters_{false};
 
   std::mutex time_mutex_;

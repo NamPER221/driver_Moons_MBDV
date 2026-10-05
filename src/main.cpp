@@ -1,11 +1,15 @@
 #include "mbdv/dual_axis_controller.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <string>
+#include <termios.h>
 #include <thread>
 #include <unistd.h>
 
@@ -20,6 +24,7 @@ void PrintHelp(const char* prog) {
       << "Moons' MBDV-2X-520AC dual-axis CANopen master\n"
       << "\nUsage: " << prog << " [mode] [options]\n"
       << "\nModes:\n"
+      << "  -t, --teleop               Interactive keyboard teleop: W/A/S/D to drive, Space to stop, Q to quit.\n"
       << "  --selftest                 Diagnose the bus only (S01..S11), then exit. Safest first step.\n"
       << "  --test-motion              PP mode: servo on, +step/-step, back to 0, servo off.\n"
       << "  --test-velocity            PV mode: servo on, run at --velocity, servo off.\n"
@@ -91,7 +96,8 @@ struct Cli {
     kVelocity,
     kKinematics,
     kMotionParallel,
-    kWatch
+    kWatch,
+    kTeleop
   };
   Mode mode{Mode::kMonitor};
   mbdv::ControllerOptions options;
@@ -214,6 +220,11 @@ bool ParseArgs(int argc, char** argv, Cli* cli) {
       cli->options.mode = mbdv::CiA402Mode::PROFILE_VELOCITY;
       cli->options.expect_control_mode =
           static_cast<uint32_t>(mbdv::DriveControlMode::kVelocityControl);
+    } else if (arg == "-t" || arg == "--teleop") {
+      cli->mode = Cli::Mode::kTeleop;
+      cli->options.mode = mbdv::CiA402Mode::PROFILE_VELOCITY;
+      cli->options.expect_control_mode =
+          static_cast<uint32_t>(mbdv::DriveControlMode::kVelocityControl);
     } else if (arg == "--monitor") {
       cli->mode = Cli::Mode::kMonitor;
     } else {
@@ -236,6 +247,165 @@ void Loop(mbdv::DualAxisController& controller, std::chrono::milliseconds period
     fn();
     std::this_thread::sleep_for(period);
   }
+}
+
+class RawTerminalScope {
+ public:
+  RawTerminalScope() {
+    if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &orig_termios_) == 0) {
+      struct termios raw = orig_termios_;
+      raw.c_lflag &= ~(ICANON | ECHO);
+      raw.c_cc[VMIN] = 0;
+      raw.c_cc[VTIME] = 0;
+      active_ = (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0);
+    }
+  }
+
+  ~RawTerminalScope() {
+    if (active_) {
+      tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios_);
+    }
+  }
+
+  bool IsActive() const noexcept { return active_; }
+
+ private:
+  struct termios orig_termios_{};
+  bool active_{false};
+};
+
+int ReadKeyNonBlocking() {
+  char c = 0;
+  const ssize_t n = read(STDIN_FILENO, &c, 1);
+  if (n <= 0) return -1;
+
+  if (c == 27) {  // ESC sequence (e.g. arrow keys)
+    char seq[2];
+    if (read(STDIN_FILENO, &seq[0], 1) <= 0) return 27;
+    if (read(STDIN_FILENO, &seq[1], 1) <= 0) return 27;
+    if (seq[0] == '[') {
+      switch (seq[1]) {
+        case 'A': return 1001;  // Up arrow
+        case 'B': return 1002;  // Down arrow
+        case 'C': return 1003;  // Right arrow
+        case 'D': return 1004;  // Left arrow
+        default: break;
+      }
+    }
+    return 27;
+  }
+  return static_cast<unsigned char>(c);
+}
+
+void RunTeleop(mbdv::DualAxisController& controller, mbdv::DiagnosticReport& report) {
+  RawTerminalScope term_scope;
+
+  std::cout << "\n"
+            << "==============================================================================\n"
+            << "       Moons' MBDV Dual-Axis KEYBOARD TELEOP (CiA 402 Profile Velocity)       \n"
+            << "==============================================================================\n"
+            << " Controls:\n"
+            << "   [W] / [Arrow Up]    : Forward  (+v)\n"
+            << "   [S] / [Arrow Down]  : Backward (-v)\n"
+            << "   [A] / [Arrow Left]  : Turn Left (+w)\n"
+            << "   [D] / [Arrow Right] : Turn Right (-w)\n"
+            << "   [SPACE] or [X]      : Brake / Instant Stop (v=0, w=0)\n"
+            << " Speed tuning:\n"
+            << "   [+] / [=]           : Increase linear step (+0.02 m/s)\n"
+            << "   [-] / [_]           : Decrease linear step (-0.02 m/s)\n"
+            << " Utilities:\n"
+            << "   [R]                 : Reset odometry pose to (0,0,0)\n"
+            << "   [Q] or [ESC]        : Quit teleop & safe Servo OFF\n"
+            << "==============================================================================\n"
+            << std::endl;
+
+  double target_v = 0.0;
+  double target_w = 0.0;
+  double step_v = 0.05;   // 0.05 m/s per tap
+  double step_w = 0.15;   // 0.15 rad/s per tap
+
+  const auto loop_interval = std::chrono::milliseconds(50);  // 20 Hz
+  auto last_time = std::chrono::steady_clock::now();
+  auto last_display_time = last_time;
+
+  while (!g_shutdown.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    const double dt = std::chrono::duration<double>(now - last_time).count();
+    last_time = now;
+
+    int key = ReadKeyNonBlocking();
+    while (key != -1) {
+      switch (key) {
+        case 'w': case 'W': case 1001:  // Forward
+          target_v += step_v;
+          break;
+        case 's': case 'S': case 1002:  // Backward
+          target_v -= step_v;
+          break;
+        case 'a': case 'A': case 1004:  // Turn Left
+          target_w += step_w;
+          break;
+        case 'd': case 'D': case 1003:  // Turn Right
+          target_w -= step_w;
+          break;
+        case ' ': case 'x': case 'X':  // Brake
+          target_v = 0.0;
+          target_w = 0.0;
+          break;
+        case '+': case '=':
+          step_v = std::min(0.50, step_v + 0.02);
+          break;
+        case '-': case '_':
+          step_v = std::max(0.01, step_v - 0.02);
+          break;
+        case 'r': case 'R':
+          controller.ResetOdometry();
+          break;
+        case 'q': case 'Q': case 27:  // Quit
+          g_shutdown.store(true);
+          break;
+        default:
+          break;
+      }
+      if (g_shutdown.load()) break;
+      key = ReadKeyNonBlocking();
+    }
+
+    if (g_shutdown.load()) break;
+
+    // Clamp velocities within safe physical limits
+    target_v = std::max(-1.0, std::min(1.0, target_v));
+    target_w = std::max(-2.5, std::min(2.5, target_w));
+
+    // Round near-zero to exact zero
+    if (std::abs(target_v) < 1e-4) target_v = 0.0;
+    if (std::abs(target_w) < 1e-4) target_w = 0.0;
+
+    controller.SetCmdVel(target_v, target_w);
+    controller.UpdateOdometry(dt);
+
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_display_time).count() >= 150) {
+      last_display_time = now;
+      const auto pose = controller.GetRobotPose();
+      const auto twist = controller.GetRobotTwist();
+      const auto& ax1 = controller.GetAxis1();
+      const auto& ax2 = controller.GetAxis2();
+
+      std::cout << "\r[CMD: v=" << std::showpos << std::fixed << std::setprecision(2) << target_v
+                << " w=" << target_w << " m/s,rad/s (step=" << std::noshowpos << step_v << ")] | "
+                << "[ACT: v=" << std::showpos << twist.linear_v << " w=" << twist.angular_w << "] | "
+                << "[AX1: " << ax1.GetActualVelocity() << " cps | AX2: " << ax2.GetActualVelocity() << " cps] | "
+                << "[POSE: x=" << std::noshowpos << std::setprecision(3) << pose.x
+                << " y=" << pose.y << " th=" << std::setprecision(1)
+                << (pose.theta * 180.0 / M_PI) << "°]   " << std::flush;
+    }
+
+    std::this_thread::sleep_for(loop_interval);
+  }
+
+  std::cout << "\n\n>>> Teleop stopped: Bringing both axes to complete stop..." << std::endl;
+  controller.SetCmdVel(0.0, 0.0);
+  controller.SetVelocitiesStaged(report, 0, 0, std::chrono::milliseconds(300));
 }
 
 }  // namespace
@@ -419,6 +589,11 @@ int main(int argc, char* argv[]) {
           break;
         }
       }
+      break;
+    }
+
+    case Cli::Mode::kTeleop: {
+      RunTeleop(controller, report);
       break;
     }
 

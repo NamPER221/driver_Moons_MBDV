@@ -398,9 +398,13 @@ bool DualAxisController::SetVelocitiesStaged(DiagnosticReport& report, int32_t v
 
 void DualAxisController::SetCmdVel(double linear_v, double angular_w) {
   const WheelSpeeds speeds = kinematics_.ComputeWheelSpeeds(linear_v, angular_w);
-  LogInfo(Stage::S13_MOTION_COMMAND, nullptr,
-          Str("cmd_vel v=", linear_v, " m/s w=", angular_w, " rad/s -> AX1 ",
-              speeds.left_driver_vel, " AX2 ", speeds.right_driver_vel, " counts/s"));
+  if (linear_v != last_cmd_v_ || angular_w != last_cmd_w_) {
+    last_cmd_v_ = linear_v;
+    last_cmd_w_ = angular_w;
+    LogInfo(Stage::S13_MOTION_COMMAND, nullptr,
+            Str("cmd_vel v=", linear_v, " m/s w=", angular_w, " rad/s -> AX1 ",
+                speeds.left_driver_vel, " AX2 ", speeds.right_driver_vel, " counts/s"));
+  }
   if (axis1_) axis1_->SetTargetVelocity(speeds.left_driver_vel);
   if (axis2_) axis2_->SetTargetVelocity(speeds.right_driver_vel);
 }

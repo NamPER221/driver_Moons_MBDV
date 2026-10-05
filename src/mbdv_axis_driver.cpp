@@ -1734,8 +1734,10 @@ void MbdvAxisDriver::SetTargetPosition(int32_t target_position, bool new_setpoin
 
 void MbdvAxisDriver::SetTargetVelocity(int32_t target_velocity) {
   Defer([this, target_velocity]() {
-    LogInfo(Stage::S13_MOTION_COMMAND, axis_tag_,
-            Str("target velocity = ", target_velocity, " counts/s"));
+    if (target_velocity != last_target_velocity_.exchange(target_velocity)) {
+      LogInfo(Stage::S13_MOTION_COMMAND, axis_tag_,
+              Str("target velocity = ", target_velocity, " counts/s"));
+    }
     try {
       tpdo_mapped[od::kTargetVelocity][0] = target_velocity;
       tpdo_mapped[od::kControlword][0] = controlword_commands::ENABLE_OPERATION;
