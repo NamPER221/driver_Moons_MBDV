@@ -18,14 +18,13 @@
 # stage S09, so a wrong value here cannot silently break motion control: S09 fails and
 # names the exact object and sub-index.
 #
-# dcfgen caveat (verified with `dcfgen -r -v`)
-# ------------------------------------------
-# dcfgen emits, as the last write to each 0x140x:01 / 0x180x:01, the COB-ID with bit 31
-# CLEAR, which means "PDO disabled", even when the YAML says `enabled: true`. The flag is
-# therefore inverted in the generated .bin. The YAML still usefully defines the mapping and
-# the transmission type, and stage S09 of the driver re-enables each PDO (bit 31 set) and
-# disables the unused RPDO4 / TPDO4 at runtime, so the final state on the drive is correct
-# regardless of what dcfgen produced.
+# CiA 301 PDO COB-ID validity rule
+# --------------------------------
+# In CiA 301, bit 31 of COB-ID (0x140x:01 / 0x180x:01) indicates validity:
+# - bit 31 = 0: PDO exists and is valid (ENABLED).
+# - bit 31 = 1: PDO does not exist or is invalid (DISABLED).
+# dcfgen correctly emits bit 31 = 0 for enabled PDOs, and stage S09 verifies
+# this on the drive at runtime.
 
 master:
   node_id: 127

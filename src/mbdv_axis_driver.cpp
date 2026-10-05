@@ -20,8 +20,9 @@ const char* controlword_path_to_string(ControlwordPath path) noexcept {
 
 namespace {
 
-/// Bit 31 of a PDO communication COB-ID ("PDO is in use").
-constexpr uint32_t kPdoValidBit = 0x80000000u;
+/// CiA 301 Sub-index 01h (COB-ID used by PDO):
+/// Bit 31: 0 = PDO exists / is valid (ENABLED), 1 = PDO does not exist / is not valid (DISABLED).
+constexpr uint32_t kPdoDisabledBit = 0x80000000u;
 
 }  // namespace
 
@@ -463,9 +464,12 @@ bool MbdvAxisDriver::ConfigureAndVerifyPdos(const PdoPlan& plan, std::string* de
     for (std::size_t s = 0; s < kSpecCount; ++s) {
       const PdoSpec& spec = specs[s];
       const uint32_t cob = ReadOr<uint32_t>(spec.comm_idx, 1, 0u);
-      if ((cob & ~kPdoValidBit) != spec.cob_id) {
+      if ((cob & ~kPdoDisabledBit) != spec.cob_id) {
         out->push_back(Str(ObjRef(spec.comm_idx, 1), " expected COB-ID ",
-                           Hex(spec.cob_id, 3), " got ", Hex(cob & ~kPdoValidBit, 3)));
+                           Hex(spec.cob_id, 3), " got ", Hex(cob & ~kPdoDisabledBit, 3)));
+      }
+      if ((cob & kPdoDisabledBit) != 0) {
+        out->push_back(Str(ObjRef(spec.comm_idx, 1), " has bit 31 set (PDO is disabled)"));
       }
       const uint8_t transmission = ReadOr<uint8_t>(spec.comm_idx, 2, 0xFFu);
       if ((transmission & 0x03u) == 0x02u) {
@@ -497,17 +501,18 @@ bool MbdvAxisDriver::ConfigureAndVerifyPdos(const PdoPlan& plan, std::string* de
     }
   };
 
-  // Enables or disables a PDO by writing its COB-ID with bit 31 set or clear.
+  // Enables or disables a PDO by writing its COB-ID with bit 31 clear or set.
+  // In CiA 301: bit 31 = 0 means PDO valid (enabled), bit 31 = 1 means PDO not valid (disabled).
   // The COB-ID value itself is always preserved: this drive rejects a literal 0 with
   // SDO abort 0x06090030 ("Invalid value for parameter"), so 0 must never be written
   // to 0x140x:01 / 0x180x:01.
   auto set_pdo_valid = [this, &why](uint16_t comm_idx, uint32_t cob, bool valid) {
-    const uint32_t desired = valid ? (cob | kPdoValidBit) : (cob & ~kPdoValidBit);
+    const uint32_t desired = valid ? (cob & ~kPdoDisabledBit) : (cob | kPdoDisabledBit);
     const uint32_t current = ReadOr<uint32_t>(comm_idx, 1, 0u);
     if (current == desired) {
       LogDebug(Stage::S09_PDO_VERIFY, axis_tag_,
                Str(ObjRef(comm_idx, 1), " already ", valid ? "enabled" : "disabled",
-                   " (COB-ID ", Hex(current & ~kPdoValidBit, 3), ")"));
+                   " (COB-ID ", Hex(current & ~kPdoDisabledBit, 3), ")"));
       return true;
     }
     if (!TryWrite<uint32_t>(comm_idx, 1, desired, &why)) {
@@ -544,7 +549,7 @@ bool MbdvAxisDriver::ConfigureAndVerifyPdos(const PdoPlan& plan, std::string* de
       const PdoSpec& spec = specs[s];
       const uint16_t map_idx = static_cast<uint16_t>(spec.comm_idx + 0x200);
 
-      // 1. disable (bit 31 clear)
+      // 1. disable (bit 31 set)
       if (!set_pdo_valid(spec.comm_idx, spec.cob_id, false)) {
         return fail(Str("could not disable ", ObjRef(spec.comm_idx, 1),
                         " before remapping; abort: ", why));
@@ -578,7 +583,7 @@ bool MbdvAxisDriver::ConfigureAndVerifyPdos(const PdoPlan& plan, std::string* de
                           static_cast<int>(spec.event_timer_ms), " ms failed: ", why));
         }
       }
-      // 7. re-enable (bit 31 set)
+      // 7. re-enable (bit 31 clear)
       if (!set_pdo_valid(spec.comm_idx, spec.cob_id, true)) {
         return fail(Str("could not enable ", ObjRef(spec.comm_idx, 1), "; abort: ", why));
       }
@@ -588,25 +593,22 @@ bool MbdvAxisDriver::ConfigureAndVerifyPdos(const PdoPlan& plan, std::string* de
     verify(&mismatches);
   }
 
-  // ---- Phase C: the used PDOs must be ENABLED (bit 31 set) to actually exchange data ----
-  // dcfgen emits the COB-ID with bit 31 CLEAR as its last write, so after a successful
-  // concise-DCF download every PDO it touched is left disabled. This step is therefore
-  // mandatory even when the mapping itself is already correct.
+  // ---- Phase C: the used PDOs must be ENABLED (bit 31 CLEAR) to actually exchange data ----
+  // In CiA 301: bit 31 = 0 means valid/enabled, bit 31 = 1 means invalid/disabled.
   int enabled_here = 0;
   for (std::size_t s = 0; s < kSpecCount; ++s) {
     const PdoSpec& spec = specs[s];
     const uint32_t cob = ReadOr<uint32_t>(spec.comm_idx, 1, 0u);
-    if ((cob & ~kPdoValidBit) != spec.cob_id || (cob & kPdoValidBit) == 0) {
-      if (!TryWrite<uint32_t>(spec.comm_idx, 1, spec.cob_id | kPdoValidBit, &why)) {
+    if ((cob & ~kPdoDisabledBit) != spec.cob_id || (cob & kPdoDisabledBit) != 0) {
+      if (!TryWrite<uint32_t>(spec.comm_idx, 1, spec.cob_id & ~kPdoDisabledBit, &why)) {
         return fail(Str("SDO write ", ObjRef(spec.comm_idx, 1), " = ",
-                        Hex(spec.cob_id | kPdoValidBit, 8), " (enable) failed: ", why));
+                        Hex(spec.cob_id & ~kPdoDisabledBit, 8), " (enable) failed: ", why));
       }
       ++enabled_here;
     }
   }
 
-  // The unused factory PDOs must stay off. dcfgen inverts its `enabled` flag, so TPDO4
-  // (0x1803) can be left valid after the download and would keep flooding the bus.
+  // The unused factory PDOs must stay disabled (bit 31 set).
   for (uint16_t unused : {0x1403u, 0x1803u}) {
     if (!set_pdo_valid(unused, unused == 0x1403 ? 0x500u + node : 0x480u + node, false)) {
       return fail(Str("could not disable unused ", ObjRef(unused, 1), "; abort: ", why));
@@ -614,8 +616,7 @@ bool MbdvAxisDriver::ConfigureAndVerifyPdos(const PdoPlan& plan, std::string* de
   }
 
   if (enabled_here > 0) {
-    notes << "; enabled " << enabled_here
-          << " PDO(s) left disabled by the generated .bin";
+    notes << "; enabled " << enabled_here << " PDO(s)";
   }
 
   if (!mismatches.empty()) {
@@ -652,8 +653,8 @@ bool MbdvAxisDriver::ConfigureAndVerifyPdos(const PdoPlan& plan, std::string* de
       const uint8_t type = ReadOr<uint8_t>(comm, 2, 0u);
       const uint16_t map_idx = static_cast<uint16_t>(comm + 0x200);
       const uint8_t count = ReadOr<uint8_t>(map_idx, 0, 0u);
-      os << "      " << ObjRef(comm, 1) << " COB-ID=" << Hex(cob & ~kPdoValidBit, 4)
-         << " valid=" << ((cob & kPdoValidBit) ? "1" : "0") << "  " << ObjRef(comm, 2)
+      os << "      " << ObjRef(comm, 1) << " COB-ID=" << Hex(cob & ~kPdoDisabledBit, 4)
+         << " valid=" << (((cob & kPdoDisabledBit) == 0) ? "1" : "0") << "  " << ObjRef(comm, 2)
          << "=" << Hex(type, 2) << " (trigger "
          << ((type & 0x03u) == 0x02u ? "RTR-only" : ((type & 0x03u) == 0x03u ? "event" : "sync"))
          << ")  " << ObjRef(map_idx, 0) << "=" << static_cast<int>(count);
