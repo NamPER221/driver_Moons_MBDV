@@ -311,15 +311,16 @@ MbdvAxisDriver::StageVerdict MbdvAxisDriver::StageIdentity(const BringUpOptions&
                  "to confirm it sticks."));
   }
 
-  // Apply a requested P1-00 *here*, before the check: this stage owns the comparison, so
+  // Apply a requested or expected P1-00 *here*, before the check: this stage owns the comparison, so
   // writing the value later could never repair a mismatch.
-  if (opt.write_control_mode != 0 && control_mode != opt.write_control_mode) {
+  const uint32_t target_mode = (opt.write_control_mode != 0) ? opt.write_control_mode : opt.expect_control_mode;
+  if (target_mode != 0 && control_mode != target_mode) {
     LogWarn(stage, axis_tag_,
-            Str("applying the requested P1-00: writing ", static_cast<int>(control_mode), " -> ",
-                static_cast<int>(opt.write_control_mode), " to ", ObjRef(od::kControlMode, 0),
-                " (", drive_control_mode_to_string(opt.write_control_mode), ")"));
-    if (!SetDriveControlModeImpl(opt.write_control_mode)) {
-      return reject(Str("could not write ", static_cast<int>(opt.write_control_mode),
+            Str("auto-aligning P1-00 to required mode: writing ", static_cast<int>(control_mode), " -> ",
+                static_cast<int>(target_mode), " to ", ObjRef(od::kControlMode, 0),
+                " (", drive_control_mode_to_string(target_mode), ")"));
+    if (!SetDriveControlModeImpl(target_mode)) {
+      return reject(Str("could not write ", static_cast<int>(target_mode),
                         " to ", ObjRef(od::kControlMode, 0)),
                     "The EDS marks 0x2A30 as rw. If the read-back does not match, the write was "
                     "refused by the drive - check that the parameter lock (0x2A35) is not "
