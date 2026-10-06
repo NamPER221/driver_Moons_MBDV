@@ -1,0 +1,188 @@
+# config/params.yaml
+# Runtime parameters for the Moons' MBDV dual-axis CANopen master.
+#
+# This file is read at start-up by src/params.cpp. Every value below is optional: a key
+# that is absent keeps the built-in default shown here, and a missing file entirely is
+# not an error. A malformed value IS an error - the program refuses to start rather than
+# silently running at the wrong rate.
+#
+# Command-line flags override the few things that are per-run (see `mbdv_dual_axis_node
+# --help`); everything else is meant to be set here.
+#
+# NOTE: config/master.yaml is a different file with a different purpose. It is the input
+# for dcfgen at BUILD time (it describes the slave download lists). Do not mix the two.
+
+# --------------------------------------------------------------------------- bus
+bus:
+  interface: can0
+  # Must match MBDV DIP SW7. Compared against object 0x2021 during stage S08.
+  expect_bitrate_bps: 500000
+
+# --------------------------------------------------------------------------- nodes
+# MBDV-2X-520AC: axis 1 node-ID is SW1..SW3, axis 2 node-ID is SW4..SW6 (manual 4.2.2).
+nodes:
+  axis1_id: 1
+  axis2_id: 2
+
+# --------------------------------------------------------------------------- rates
+rates:
+  # Control and feedback rate: teleop loop period, odometry integration period and
+  # odometry publication rate. 200 Hz = 5 ms.
+  #
+  # Bus budget at 500 kbps with this setting: 6 TPDO at 200 Hz = 1200 frames/s, plus one
+  # RPDO per axis per period for the setpoint = 400 frames/s, plus the controlword
+  # refresh below. That is roughly 40% bus load. Above ~300 Hz the six TPDOs start to
+  # dominate and the drive's own DSP cycle becomes the limit, not the bus.
+  control_hz: 200.0
+
+  # How often the Controlword is re-sent. The controlword lives in all three RPDOs, so
+  # lely transmits one frame per RPDO every time it is written; sending it every 5 ms
+  # would triple the frame count for no benefit. 20 Hz is far faster than the drive's
+  # communication watchdog (0x2060, default 500 ms) needs.
+  controlword_hz: 20.0
+
+  # TPDO event timers in ms. 5 ms = 200 Hz of encoder feedback, which is what the odometry
+  # integrates. tpdo3 carries the alarm objects and does not need to be that fast.
+  tpdo1_event_ms: 5      # 0x1800: statusword
+  tpdo2_event_ms: 5      # 0x1801: position + velocity
+  tpdo3_event_ms: 50     # 0x1802: 0x603F + 0x200F
+
+# --------------------------------------------------------------------------- heartbeat
+# CiA 301 heartbeat = the CAN connection-loss signal.
+#
+# The drive broadcasts 0x700+node itself, from object 0x1017 (producer heartbeat). The
+# master subscribes with a consumer entry in its own 0x1016 and lely raises a heartbeat
+# event when a frame does not arrive inside that window: that axis is LOST and the stop
+# output turns on (see `liveness`). The NMT state byte inside the heartbeat frame counts
+# too: a node that reports anything but OPERATIONAL is treated as lost.
+#
+# The drive ships 0x1017 = 1000 ms, which would leave a cut cable unnoticed for 1.5 s or
+# more. 100 ms producer / 300 ms consumer detects it within 300 ms, keeps a 3x margin for
+# late frames, and costs 10 frames/s per axis - well under 1% of the 500 kbps bus. If a
+# spurious "heartbeat lost" ever appears, widen consumer_ms first; keep it >= 2x producer.
+#
+# After detection lely itself sends NMT Reset Node to the silent slave (0x1F80 = 1 in
+# master.dcf), so a drive that still hears the bus restarts that axis; the program then
+# reconnects it while the odometry freezes rather than jumping.
+# Set `consumer_ms: 0` to switch heartbeat monitoring - and CAN-loss detection - off.
+heartbeat:
+  # Written to the drive's 0x1017. 0 leaves whatever the drive already has.
+  producer_ms: 100
+  # This IS the loss-detection window - there is no separate timeout setting, because the
+  # supervisor acts on exactly this one signal. Must be greater than producer_ms.
+  consumer_ms: 300
+
+# --------------------------------------------------------------------------- liveness
+# A differential-drive robot with one wheel gone can only spin, so as soon as ANY axis is
+# lost or faults the STOP OUTPUT is asserted (DualAxisController::StopRequested() and the
+# SetStopCallback() hook) and every axis CAN still reach is commanded to zero.
+#
+# Once the CAN link is gone only hardware can stop a drive, so wire the stop output to an
+# IO that drives the drives' E-STOP inputs: MBDV-2X 1_X4 (pin 4) and 2_X4 (pin 12), P5-03
+# (hardware manual 4.10.3, 7.1.7). For a fail-safe circuit set P5-03 = 14 ("Open = E-stop")
+# and keep the input energised only while the stop output is off, so a broken wire, a dead
+# IO supply or a crashed host stops the robot as well. The drive brakes on P2-01 then.
+#
+# An enabled axis counts as gone on the first of these signals:
+#   - CAN connection lost: its heartbeat times out (heartbeat.consumer_ms), or the NMT
+#     state in its heartbeat is no longer OPERATIONAL;
+#   - its servo dropped out of Operation Enabled (fault, STO, E-STOP input).
+# A CAN error frame on its own does not stop the robot (see reconnect.recover_can_link):
+# a link that is really gone also silences the heartbeat.
+#
+# The stop output is released only when every node's heartbeat is back (OPERATIONAL), a
+# zero command is in force and stop_hold_ms has passed. Servos switched off meanwhile are
+# then re-enabled at zero speed; motion needs a new command, so the robot never restarts
+# by itself.
+liveness:
+  # Minimum time the stop output stays on, so even a short fault gives the IO a usable pulse.
+  stop_hold_ms: 500
+
+# --------------------------------------------------------------------------- reconnect
+# Keeps the process running instead of exiting when something goes away.
+reconnect:
+  enabled: true
+  # Re-open the SocketCAN interface when the kernel reports a controller error, which is
+  # what a yanked cable or a drive power-cycling looks like.
+  recover_can_link: true
+  backoff_ms: 500        # first retry delay
+  backoff_max_ms: 5000   # delay ceiling while a node stays down
+  max_attempts: 0        # 0 = keep trying forever, which is what an unattended rig needs
+
+# --------------------------------------------------------------------------- fault recovery
+# A fault (including STO, see the note below) is cleared with a CiA 402 fault reset and the
+# axis is re-enabled, as long as the cause has gone. Both axes stay stopped meanwhile (see
+# `liveness`). A cause that only hardware can clear (STO, a limit/E-STOP input, no main
+# power) is re-checked every retry_backoff_ms without counting against max_attempts.
+#
+# STO IS NOT CLEARABLE FROM SOFTWARE. Manual 4.11 calls it "a hardware level safety
+# function"; it is armed by the SF1/SF2 inputs on connector CN5 going open. No CANopen
+# object can release it - manual 4.11.1(7) says the alarm clears once STO is deactivated,
+# i.e. when an operator refits the connector. This program detects that state, says so
+# precisely, and then recovers by itself as soon as the hardware is back.
+fault_recovery:
+  auto_reset: true
+  retry_backoff_ms: 1000
+  max_attempts: 5        # per fault episode, then it stops and waits for a new fault
+
+# --------------------------------------------------------------------------- drive
+drive:
+  # P1-00 in object 0x2A30, which is what actually selects the drive's internal mode
+  # (manual 8.2): 21 = Position, 15 = Velocity, 1 = Torque. 0x6060 is ignored unless this
+  # matches. The keyboard teleop needs 15.
+  expect_p1_00: 15
+  # Written to 0x2A30 during S08 when non-zero. Deliberately NOT persisted with
+  # 0x1010:01 - a stored write that aborts part way can corrupt the parameter block.
+  write_p1_00: 0
+  # Profile ramp written to 0x6083/0x6084 during S08. This drive can report Operation
+  # Enabled and then ignore every setpoint forever if the ramp is zero, so these are set
+  # explicitly rather than trusted to come up from Luna. Set either to 0 to leave the
+  # drive's own value alone. Units: counts/s^2. These values match the bring-up that is
+  # known to run on this hardware.
+  profile_accel: 25000
+  profile_decel: 50000
+  # Communication watchdog 0x2060 (manual P1-39). -1 = leave alone, 0 = disable,
+  # > 0 = timeout in ms. Measured disabled on this drive, so it is not the cause of any
+  # EMERGENCY COMMUNICATION here.
+  watchdog_ms: -1
+  # 0x2060:05 = Luna P1-40 "action after the watchdog is triggered". -1 = leave alone.
+  # IMPORTANT: once the CAN cable is cut the master can no longer stop the drive, and a bus
+  # watchdog trip on its own is a Warning that "does not change the current state"
+  # (hardware manual 9.1). The axes then keep their last setpoint unless watchdog_ms > 0
+  # AND this selects a stopping action. The value table is in the MBDV CANopen manual,
+  # which is not in docx/ - confirm the value on the bench before relying on it.
+  watchdog_action: -1
+  # false = verify the PDO records at S09 but never write them (diagnosis only).
+  program_pdos: true
+
+# --------------------------------------------------------------------------- kinematics
+# Differential-drive geometry. These decide how encoder counts become metres, so getting
+# them wrong scales the whole odometry - see odometry_kinematics_summary.md.
+kinematics:
+  wheel_radius_m: 0.07333
+  wheel_base_m: 0.4544
+  gear_ratio: 1.0
+  encoder_cpr: 10000
+  max_linear_velocity: 1.5     # m/s
+  max_angular_velocity: 3.0    # rad/s
+
+# --------------------------------------------------------------------------- odometry out
+# Odometry is produced at rates.control_hz for the layers above this program (the ROS2
+# navigation stack reads pose and twist; see odometry_kinematics_summary.md).
+#
+#   callback: a std::function registered with DualAxisController::SetOdometryCallback()
+#   udp:      a 64-byte binary datagram per sample, layout in include/mbdv/params.hpp
+odometry:
+  enabled: true
+  callback: true
+  udp: false
+  udp_host: 239.255.0.10    # multicast group for subscribers
+  udp_port: 5565
+  udp_repeat: 1             # resend the last sample this many times per period
+
+# --------------------------------------------------------------------------- misc
+misc:
+  dcf: config/master.dcf
+  bin: ""                   # empty = the DCF names its own download file
+  boot_timeout_ms: 3000
+  servo_timeout_ms: 2000

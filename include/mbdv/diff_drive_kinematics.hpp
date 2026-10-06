@@ -53,6 +53,16 @@ class DiffDriveKinematics {
   explicit DiffDriveKinematics(const KinematicsConfig& config = KinematicsConfig());
 
   /**
+   * @brief Replaces the geometry and limits, keeping the integrated pose.
+   *
+   * A setter rather than assignment because the class holds a mutex, so it is neither
+   * copyable nor movable. The pose is deliberately preserved: a geometry correction
+   * should not teleport the robot, even though it does invalidate the wheel travel
+   * already integrated with the old numbers.
+   */
+  void SetConfig(const KinematicsConfig& config);
+
+  /**
    * @brief Inverse Kinematics: Converts robot body twist (v, w) into left/right wheel speeds.
    * Clamps velocities to configured maximums to protect actuators.
    */
@@ -62,7 +72,8 @@ class DiffDriveKinematics {
    * @brief Forward Kinematics: Integrates odometry pose from accumulated encoder counts.
    * @param left_ticks Actual position from Axis 1 (Object 0x6064).
    * @param right_ticks Actual position from Axis 2 (Object 0x6064).
-   * @param dt_sec Elapsed time interval in seconds.
+   * @param dt_sec Elapsed time interval in seconds (unused: the twist comes from
+   *               UpdateTwistFromSpeeds()).
    */
   void UpdateOdometryFromTicks(int32_t left_ticks, int32_t right_ticks, double dt_sec);
 
@@ -73,12 +84,24 @@ class DiffDriveKinematics {
    */
   RobotTwist ComputeRobotTwistFromSpeeds(int32_t left_driver_vel, int32_t right_driver_vel) const;
 
+  /// ComputeRobotTwistFromSpeeds() stored as the twist GetTwist() returns.
+  void UpdateTwistFromSpeeds(int32_t left_driver_vel, int32_t right_driver_vel);
+
   // Thread-safe accessors
   RobotPose GetPose() const;
   RobotTwist GetTwist() const;
-  const KinematicsConfig& GetConfig() const noexcept { return config_; }
-
   void ResetPose(double x = 0.0, double y = 0.0, double theta = 0.0);
+
+  /**
+   * @brief Re-zeroes the pose AND re-baselines the encoder deltas.
+   *
+   * ResetPose() on its own only moves the pose, so the next UpdateOdometryFromTicks()
+   * still sees the previous tick values and integrates one huge phantom step. That is
+   * exactly what happens after a drive reconnects: the drive may have restarted and
+   * reported position 0 while the integrated pose is somewhere else entirely. This
+   * makes both the pose and the delta reference change at the same instant.
+   */
+  void Realign(int32_t left_ticks, int32_t right_ticks);
 
  private:
   static double NormalizeAngle(double angle);

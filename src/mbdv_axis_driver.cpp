@@ -5,24 +5,19 @@
 #include <cstdlib>
 #include <future>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace mbdv {
-
-const char* controlword_path_to_string(ControlwordPath path) noexcept {
-  switch (path) {
-    case ControlwordPath::kRpdo: return "RPDO (real-time PDO)";
-    case ControlwordPath::kSdo: return "SDO fallback (RPDO did not work)";
-    case ControlwordPath::kNone: return "none";
-  }
-  return "none";
-}
 
 namespace {
 
 /// CiA 301 Sub-index 01h (COB-ID used by PDO):
 /// Bit 31: 0 = PDO exists / is valid (ENABLED), 1 = PDO does not exist / is not valid (DISABLED).
 constexpr uint32_t kPdoDisabledBit = 0x80000000u;
+
+/// last_target_velocity_ before any setpoint was sent (see the header's initialiser).
+constexpr int32_t kNoSetpoint = 0x7FFFFFFF;
 
 }  // namespace
 
@@ -36,6 +31,122 @@ MbdvAxisDriver::MbdvAxisDriver(lely::canopen::AsyncMaster& master, uint8_t node_
       node_id_(node_id),
       axis_name_(std::move(axis_name)),
       axis_tag_(axis_tag ? axis_tag : "AX?") {}
+
+
+// ---------------------------------------------------------------------------
+// Per-node RPDO transmit
+// ---------------------------------------------------------------------------
+
+void MbdvAxisDriver::SetRpdoSender(RpdoSender sender) {
+  rpdo_sender_ = std::move(sender);
+}
+
+int8_t MbdvAxisDriver::CurrentModeForRpdo1() {
+  int8_t mode = mode_of_operation_.load();
+  if (mode >= 0) return mode;
+  // No mode has been selected through this driver yet: fall back to whatever the master
+  // object dictionary holds, so an RPDO1 sent before S10 cannot write 0xFF into 0x6060.
+  try {
+    mode = ReadOr<int8_t>(od::kModeOfOperation, 0, static_cast<int8_t>(0));
+  } catch (const std::exception&) {
+    mode = 0;
+  }
+  return mode;
+}
+
+void MbdvAxisDriver::ZeroVelocityNow() {
+  last_target_velocity_.store(0);
+  try {
+    if (!SendRpdo(3, controlword_commands::ENABLE_OPERATION, true, 0)) {
+      LogError(Stage::S12_SERVO_ON, axis_tag_,
+               "could not send the zero-velocity stop command; this axis may move on its own");
+    }
+  } catch (const std::exception& ex) {
+    LogError(Stage::S12_SERVO_ON, axis_tag_, Str("zero-velocity stop failed: ", ex.what()));
+  }
+}
+
+void MbdvAxisDriver::StopNow() {
+  last_target_velocity_.store(0);
+  const CiA402State st = state_.load();
+  // Controlword 0x000F enables an axis in Switched On or Ready to Switch On (CiA 402
+  // transitions 3 and 4) and resumes one in Quick Stop Active (transition 16): a stop must
+  // never be what switches an axis back on.
+  if (st == CiA402State::SWITCHED_ON || st == CiA402State::READY_TO_SWITCH_ON ||
+      st == CiA402State::QUICK_STOP_ACTIVE) {
+    return;
+  }
+  try {
+    bool sent = false;
+    const int8_t mode = mode_of_operation_.load();
+    if (mode == static_cast<int8_t>(CiA402Mode::PROFILE_POSITION)) {
+      // 0x60FF means nothing in profile position; the Halt bit stops the running profile.
+      halted_.store(true);
+      sent = SendRpdo(1,
+                      static_cast<uint16_t>(controlword_commands::ENABLE_OPERATION |
+                                            controlword_bits::HALT),
+                      false, mode);
+    } else {
+      sent = SendRpdo(3, controlword_commands::ENABLE_OPERATION, true, 0);
+    }
+    if (!sent) {
+      LogError(Stage::S13_MOTION_COMMAND, axis_tag_, "could not send the stop command");
+    }
+  } catch (const std::exception& ex) {
+    LogError(Stage::S13_MOTION_COMMAND, axis_tag_, Str("stop command failed: ", ex.what()));
+  }
+}
+
+bool MbdvAxisDriver::WaitForReconnectReady(std::chrono::milliseconds timeout) {
+  // lely ends every boot-slave process with OnBoot(), successful or not; the cap only
+  // guards against a boot-up frame that never started one.
+  constexpr std::chrono::seconds kBootProcessCap{10};
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!abort_.load()) {
+    bool booting = boot_in_progress_.load();
+    if (booting) {
+      std::lock_guard<std::mutex> lock(time_mutex_);
+      booting = std::chrono::steady_clock::now() - boot_start_time_ < kBootProcessCap;
+    }
+    if (!heartbeat_lost_.load() && !booting) return true;
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  return false;
+}
+
+bool MbdvAxisDriver::SendRpdo(uint8_t pdo_no, uint16_t controlword, bool has_setpoint,
+                              int32_t setpoint) {
+  if (!rpdo_sender_) {
+    // No per-node transport installed: fall back to the shared object dictionary. That is
+    // only correct for a single-node bus, so say so once and loudly.
+    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+    if (!warned.test_and_set()) {
+      LogError(Stage::S13_MOTION_COMMAND, axis_tag_,
+               "no per-node RPDO transport installed: falling back to the master's shared "
+               "object dictionary. With more than one node on this master every axis will "
+               "receive every other axis' setpoint and the axes will cancel each other out.");
+    }
+    try {
+      tpdo_mapped[od::kControlword][0] = controlword;
+      if (has_setpoint) {
+        if (pdo_no == 2) {
+          tpdo_mapped[od::kTargetPosition][0] = setpoint;
+          tpdo_mapped[od::kTargetPosition][0].WriteEvent();
+        } else if (pdo_no == 3) {
+          tpdo_mapped[od::kTargetVelocity][0] = setpoint;
+          tpdo_mapped[od::kTargetVelocity][0].WriteEvent();
+        }
+      }
+      tpdo_mapped[od::kControlword][0].WriteEvent();
+      master.TpdoEvent();
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
+  return rpdo_sender_(node_id_, pdo_no, controlword, has_setpoint, setpoint);
+}
 
 // ---------------------------------------------------------------------------
 // Small SDO helpers (fiber side only)
@@ -100,7 +211,7 @@ std::string MbdvAxisDriver::TelemetryStaleNote() const {
 
 bool MbdvAxisDriver::StageBootUp(const BringUpOptions& opt) {
   const auto deadline = std::chrono::steady_clock::now() + opt.boot_timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline && !abort_.load()) {
     if (boot_seen_.load()) return true;
     USleep(10000);
   }
@@ -116,7 +227,7 @@ bool MbdvAxisDriver::StagePreOp(const BringUpOptions& opt) {
   // 0x600+node, i.e. it left Boot-up and reached PRE-OPERATIONAL.
   const auto deadline = std::chrono::steady_clock::now() + opt.boot_timeout;
   std::string last_error = "no attempt made";
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline && !abort_.load()) {
     try {
       const uint16_t sw = Wait(AsyncRead<uint16_t>(od::kStatusword, 0));
       RefreshStateFromStatusword(sw);
@@ -145,7 +256,7 @@ bool MbdvAxisDriver::StageNmtStart(const BringUpOptions& opt) {
   master.Command(lely::canopen::NmtCommand::START, id());
 
   const auto deadline = std::chrono::steady_clock::now() + opt.boot_timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline && !abort_.load()) {
     if (is_operational_.load()) return true;
     USleep(10000);
   }
@@ -281,11 +392,6 @@ MbdvAxisDriver::StageVerdict MbdvAxisDriver::StageIdentity(const BringUpOptions&
             "SW8 reports a 120 ohm terminator fitted; it must only be ON at the last device "
             "on the bus");
   }
-  if (dip.node1_raw == 0) {
-    LogInfo(stage, axis_tag_,
-            "axis1 DIP address field is 0, so this axis takes its node-ID from the Luna "
-            "software setting. That is valid - objects 0x2020/0x2021 remain authoritative.");
-  }
   if (!dip.baud_from_dip && opt.expect_bitrate_bps != 0 &&
       opt.expect_bitrate_bps != 500000u) {
     LogInfo(stage, axis_tag_,
@@ -329,13 +435,48 @@ MbdvAxisDriver::StageVerdict MbdvAxisDriver::StageIdentity(const BringUpOptions&
     control_mode = ReadOr<uint32_t>(od::kControlMode, 0, 0u);
   }
 
+  // --- 0x6083/0x6084 profile acceleration / deceleration ---
+  //
+  // These are the ramp the drive uses for *both* profile position and profile velocity.
+  // If they are zero the drive will happily reach Operation Enabled and then ignore every
+  // setpoint forever, because there is no ramp to follow. Write them here, while the node
+  // is still in pre-operational, and report what came back so a refused write is visible
+  // instead of showing up later as "the motor never moves".
+  if (opt.profile_accel != 0 || opt.profile_decel != 0) {
+    const auto apply = [this, opt](uint16_t idx, uint32_t value, const char* label) {
+      const uint32_t before = ReadOr<uint32_t>(idx, 0, 0u);
+      if (before == value) {
+        LogInfo(stage, axis_tag_,
+                Str(label, " ", ObjRef(idx, 0), " = ", before, " already as required"));
+        return true;
+      }
+      std::string why;
+      if (!TryWrite<uint32_t>(idx, 0, value, &why)) {
+        LogWarn(stage, axis_tag_,
+                Str("SDO write ", value, " to ", ObjRef(idx, 0), " (", label, ") failed: ",
+                    why, "; the drive keeps ", before,
+                    ". A zero ramp makes the drive ignore every target position even while "
+                    "it reports Operation Enabled."));
+        return false;
+      }
+      const uint32_t after = ReadOr<uint32_t>(idx, 0, 0u);
+      LogInfo(stage, axis_tag_,
+              Str(label, ": ", ObjRef(idx, 0), " ", before, " -> ", after,
+                  (after == value) ? " (accepted)" : " (READ-BACK MISMATCH)"));
+      return after == value;
+    };
+    apply(od::kProfileAcceleration, opt.profile_accel, "profile acceleration");
+    apply(od::kProfileDeceleration, opt.profile_decel, "profile deceleration");
+  }
+
   if (opt.expect_control_mode != 0 && control_mode != opt.expect_control_mode) {
     return reject(Str("drive control mode mismatch: 0x2A30 = ", static_cast<int>(control_mode),
                       " but ", static_cast<int>(opt.expect_control_mode),
                       " is required for the requested CiA 402 mode"),
                   "0x6060 is ignored unless P1-00 selects the matching drive control mode "
                   "(PP=21, PV=15, TQ=1). Re-run with --p1-00 21 for PP, --p1-00 15 for PV, "
-                  "or --p1-00 1 for TQ; the tool writes it and stores it with 0x1010:01 = 1.");
+                  "or --p1-00 1 for TQ; the tool writes it for this power cycle only (it is "
+                  "deliberately not stored with 0x1010:01) - set P1-00 in Luna to keep it.");
   }
 
   // --- 0x2060 communication watchdog (manual P1-39) ---
@@ -387,6 +528,33 @@ MbdvAxisDriver::StageVerdict MbdvAxisDriver::StageIdentity(const BringUpOptions&
                   "timeout=0 ms), so it is not the source of the COMMUNICATION(b4) EMERGENCY. "
                   "Set P1-39 in Luna if it needs changing."));
     }
+  }
+
+  // --- 0x2060:05 action on a watchdog trip (Luna P1-40) ---
+  // Without a stopping action a tripped watchdog is only a Warning that "does not change the
+  // current state" (hardware manual 9.1): with the CAN cable cut the axes keep their last
+  // setpoint. The meaning of each value is not in the hardware manual, so nothing is written
+  // unless params.yaml names one.
+  const uint16_t wd_option = ReadOr<uint16_t>(od::kCommWatchdog, od::kCommWatchdogOption, 0xFFFFu);
+  if (opt.watchdog_action >= 0 && wd_option != static_cast<uint16_t>(opt.watchdog_action)) {
+    std::string why;
+    if (TryWrite<uint16_t>(od::kCommWatchdog, od::kCommWatchdogOption,
+                           static_cast<uint16_t>(opt.watchdog_action), &why)) {
+      LogWarn(stage, axis_tag_,
+              Str(ObjRef(od::kCommWatchdog, od::kCommWatchdogOption), " (watchdog action) ",
+                  static_cast<int>(wd_option), " -> ",
+                  static_cast<int>(ReadOr<uint16_t>(od::kCommWatchdog, od::kCommWatchdogOption,
+                                                    0xFFFFu))));
+    } else {
+      LogWarn(stage, axis_tag_,
+              Str("could not write ", opt.watchdog_action, " to ",
+                  ObjRef(od::kCommWatchdog, od::kCommWatchdogOption), ": ", why));
+    }
+  } else {
+    LogInfo(stage, axis_tag_,
+            Str(ObjRef(od::kCommWatchdog, od::kCommWatchdogOption), " (watchdog action) = ",
+                wd_option == 0xFFFFu ? std::string("unreadable") : Str(static_cast<int>(wd_option)),
+                opt.watchdog_action >= 0 ? " as required" : " (left untouched)"));
   }
 
   // --- 0x1001 error register / 0x603F error code ---
@@ -722,6 +890,116 @@ bool MbdvAxisDriver::StageFaultReset(const BringUpOptions& opt) {
 }
 
 // ---------------------------------------------------------------------------
+// Liveness: CiA 301 heartbeat
+// ---------------------------------------------------------------------------
+
+bool MbdvAxisDriver::SetHeartbeatProducerImpl(uint16_t period_ms) {
+  if (period_ms == 0) return true;  // caller asked to leave the drive's own default
+
+  std::string why;
+  if (!TryWrite<uint16_t>(od::kProducerHeartbeatTime, 0, period_ms, &why)) {
+    LogWarn(Stage::S08_IDENTITY, axis_tag_,
+            Str("cannot set ", ObjRef(od::kProducerHeartbeatTime, 0), " = ", period_ms,
+                " ms (", why, "). Liveness detection will be as slow as the drive's own "
+                "default."));
+    return false;
+  }
+  const uint16_t readback = ReadOr<uint16_t>(od::kProducerHeartbeatTime, 0, 0u);
+  LogInfo(Stage::S08_IDENTITY, axis_tag_,
+          Str(ObjRef(od::kProducerHeartbeatTime, 0), " = ", readback, " ms (the drive now "
+              "broadcasts 0x700+node every ", readback, " ms)"));
+  return readback == period_ms;
+}
+
+// ---------------------------------------------------------------------------
+// Fault diagnosis and recovery
+// ---------------------------------------------------------------------------
+
+bool MbdvAxisDriver::RecoverServo(const char* reason,
+                                  std::chrono::milliseconds fault_timeout,
+                                  std::chrono::milliseconds servo_timeout, FaultKind* cause) {
+  if (cause) *cause = FaultKind::kNone;
+  if (abort_.load()) return false;
+  auto promise = std::make_shared<std::promise<bool>>();
+  auto future = promise->get_future();
+  // Written on the driver strand, read here once the future is ready.
+  auto kind_seen = std::make_shared<std::atomic<int>>(static_cast<int>(FaultKind::kNone));
+
+  Defer([this, reason, fault_timeout, servo_timeout, promise, kind_seen]() {
+    try {
+      LogInfo(Stage::S11_FAULT_RESET, axis_tag_,
+              Str("automatic recovery requested (", reason ? reason : "unspecified", ")"));
+      const DriveSnapshot before = ReadDriveSnapshotImpl();
+      const FaultKind kind = ClassifyFault(before);
+      kind_seen->store(static_cast<int>(kind));
+      LogInfo(Stage::S11_FAULT_RESET, axis_tag_,
+              Str("cause: ", fault_kind_to_string(kind), " - ", ExplainFaultKind(kind)));
+
+      if (kind == FaultKind::kSto || kind == FaultKind::kLimit ||
+          kind == FaultKind::kNoMainPower) {
+        // These are hardware states. Retrying now would just spin, and for STO the
+        // manual is explicit that only the safety circuit can clear it.
+        LogWarn(Stage::S11_FAULT_RESET, axis_tag_,
+                "not retrying: the cause is a hardware input that a person has to clear. "
+                "Waiting for it to change.");
+        promise->set_value(false);
+        return;
+      }
+
+      // CiA 402: the rising edge of controlword bit 7 clears a latched fault, and
+      // 0x2006 = 1 is the manufacturer's DSP-level clear.
+      const bool faulted = (statusword_.load() & statusword_bits::FAULT) != 0;
+      if (faulted) {
+        bool cleared = ApplyControlword(controlword_commands::FAULT_RESET,
+                                        CiA402State::SWITCH_ON_DISABLED, fault_timeout);
+        if (!cleared) {
+          std::string why;
+          if (TryWrite<uint8_t>(od::kDspClearAlarm, 0, uint8_t{1}, &why)) {
+            USleep(200000);
+            RefreshStatusword();
+            cleared = (statusword_.load() & statusword_bits::FAULT) == 0;
+          } else {
+            LogWarn(Stage::S11_FAULT_RESET, axis_tag_, Str("0x2006 write failed: ", why));
+          }
+        }
+        if (!cleared) {
+          LogWarn(Stage::S11_FAULT_RESET, axis_tag_,
+                  "the fault did not clear; leaving the axis alone and waiting.");
+          promise->set_value(false);
+          return;
+        }
+        LogInfo(Stage::S11_FAULT_RESET, axis_tag_,
+                Str("fault cleared, Statusword now ", DecodeStatusword(statusword_.load())));
+      }
+
+      SendControlwordQuiet(controlword_commands::DISABLE_VOLTAGE);
+      USleep(50000);
+
+      if (!EnableServoImpl(servo_timeout)) {
+        LogWarn(Stage::S12_SERVO_ON, axis_tag_,
+                Str("re-enable after recovery failed; still ",
+                    cia402_state_to_string(state_.load())));
+        promise->set_value(false);
+        return;
+      }
+      LogInfo(Stage::S12_SERVO_ON, axis_tag_,
+              Str("servo re-enabled by automatic recovery: ", DecodeStatusword(statusword_.load())));
+      promise->set_value(true);
+    } catch (const std::exception& ex) {
+      LogWarn(Stage::S11_FAULT_RESET, axis_tag_, Str("automatic recovery failed: ", ex.what()));
+      promise->set_value(false);
+    }
+  });
+
+  const auto budget = fault_timeout + servo_timeout * 3 + std::chrono::milliseconds(3000);
+  const bool ready = future.wait_for(budget) == std::future_status::ready;
+  if (cause) *cause = static_cast<FaultKind>(kind_seen->load());
+  if (ready) return future.get();
+  LogWarn(Stage::S11_FAULT_RESET, axis_tag_, "automatic recovery timed out");
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // BringUp driver (stages S05..S11)
 // ---------------------------------------------------------------------------
 
@@ -731,15 +1009,8 @@ bool MbdvAxisDriver::BringUp(DiagnosticReport& report, const BringUpOptions& opt
   const int64_t budget_ms = options.boot_timeout.count() * 5 + 8000;
 
   Defer([this, &report, options, promise]() {
-    SetSdoControlwordFallback(options.sdo_controlword_fallback);
-    SetSdoSetpoints(options.sdo_setpoints);
-    SetStoreParameters(options.store_parameters);
-    auto t0 = std::chrono::steady_clock::now();
-    auto record = [this, &report, &t0](Stage stage, bool ok, const std::string& reason,
-                                        const std::string& hint = std::string()) {
-      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - t0);
-      t0 = std::chrono::steady_clock::now();
+    auto record = [this, &report](Stage stage, bool ok, const std::string& reason,
+                                  const std::string& hint = std::string()) {
       if (ok) {
         report.Pass(stage, axis_tag_, reason);
       } else {
@@ -766,6 +1037,40 @@ bool MbdvAxisDriver::BringUp(DiagnosticReport& report, const BringUpOptions& opt
         if (!ok) {
           promise->set_value(false);
           return;
+        }
+      }
+
+      // Liveness right after boot-up: from here on a node that stops answering is
+      // detectable, which is what lets the supervisor reconnect instead of hanging on a
+      // dead axis. Not earlier: until OnBoot() lely's concise-DCF download owns this node's
+      // SDO channel, so the write failed on whichever axis booted first ("Resource not
+      // available: SDO connection").
+      //
+      // The drive's producer is written BEFORE the master's consumer is tightened: lely
+      // re-arms the consumer on every heartbeat it receives (co_nmt_hb_recv), so a 300 ms
+      // window armed while the drive still sends every 1000 ms would time out, and lely would
+      // reset the node.
+      const bool producer_ok = options.heartbeat_producer_ms == 0 ||
+                               SetHeartbeatProducerImpl(options.heartbeat_producer_ms);
+      if (!producer_ok) {
+        LogWarn(Stage::S08_IDENTITY, axis_tag_,
+                Str(ObjRef(od::kProducerHeartbeatTime, 0), " was not set to ",
+                    options.heartbeat_producer_ms,
+                    " ms; keeping the consumer time from the DCF (config/master.yaml) rather "
+                    "than a window the drive's own period might not meet."));
+      } else if (options.heartbeat_consumer_ms > 0) {
+        heartbeat_consumer_ms_.store(options.heartbeat_consumer_ms);
+        std::error_code ec;
+        ConfigHeartbeat(std::chrono::milliseconds(options.heartbeat_consumer_ms), ec);
+        if (ec) {
+          LogWarn(Stage::S08_IDENTITY, axis_tag_,
+                  Str("cannot install a heartbeat consumer: ", ec.message(),
+                      ". Liveness detection is disabled for this node."));
+          heartbeat_consumer_ms_.store(0);
+        } else {
+          LogInfo(Stage::S08_IDENTITY, axis_tag_,
+                  Str("watching ", ObjRef(0x700, 0), "+node for this node every ",
+                      options.heartbeat_consumer_ms, " ms"));
         }
       }
 
@@ -838,7 +1143,11 @@ bool MbdvAxisDriver::BringUp(DiagnosticReport& report, const BringUpOptions& opt
       report.Pending(Stage::S10_MODE_OF_OPERATION, axis_tag_);
 
       // ---------------- S11 FAULT RESET ----------------
-      {
+      if (!options.fault_reset) {
+        // A reconnect: the stop output may be holding the drives' E-STOP inputs, so a reset
+        // could not succeed yet; RecoverServo() clears any fault before it re-enables.
+        report.Skip(Stage::S11_FAULT_RESET, axis_tag_, "deferred to the servo-enable step");
+      } else {
         const bool ok = StageFaultReset(options);
         record(Stage::S11_FAULT_RESET, ok,
                ok ? "fault state clear"
@@ -883,6 +1192,7 @@ bool MbdvAxisDriver::SetModeImpl(CiA402Mode mode, std::chrono::milliseconds time
               cia402_mode_to_string(mode), ")"));
 
   std::string why;
+  mode_of_operation_.store(want);
   if (!TryWrite<int8_t>(od::kModeOfOperation, 0, want, &why)) {
     LogError(Stage::S10_MODE_OF_OPERATION, axis_tag_, Str("SDO write 0x6060 failed: ", why));
     return false;
@@ -891,10 +1201,9 @@ bool MbdvAxisDriver::SetModeImpl(CiA402Mode mode, std::chrono::milliseconds time
   // Confirm with 0x6061 Modes of operation display, as CiA 402 requires.
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   int8_t display = -1;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline && !abort_.load()) {
     display = ReadOr<int8_t>(od::kModeOfOperationDisplay, 0, static_cast<int8_t>(-1));
     if (display == want) {
-      mode_display_.store(display);
       LogInfo(Stage::S10_MODE_OF_OPERATION, axis_tag_,
               Str("0x6061 confirms mode ", static_cast<int>(display), " (",
                   cia402_mode_to_string(static_cast<CiA402Mode>(display)), ")"));
@@ -958,7 +1267,7 @@ bool MbdvAxisDriver::SetModeStaged(DiagnosticReport& report, CiA402Mode mode,
 bool MbdvAxisDriver::WaitForState(CiA402State target, std::chrono::milliseconds timeout) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   int refresh_countdown = 0;
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline && !abort_.load()) {
     if (state_.load() == target) return true;
     if (state_.load() == CiA402State::FAULT ||
         state_.load() == CiA402State::FAULT_REACTION_ACTIVE) {
@@ -980,80 +1289,32 @@ bool MbdvAxisDriver::ApplyControlword(uint16_t controlword, CiA402State expect,
   LogDebug(Stage::S12_SERVO_ON, axis_tag_,
            Str("Controlword = ", DecodeControlword(controlword)));
 
-  // Split the budget so a broken RPDO path is detected without doubling the wait.
-  const std::chrono::milliseconds rpdo_budget(timeout.count() / 2);
-  const std::chrono::milliseconds sdo_budget(timeout.count() - rpdo_budget.count());
-
-  // ---- path 1: real-time PDO (RPDO1) ----
   try {
-    tpdo_mapped[od::kControlword][0] = controlword;
-    master.TpdoEvent();
+    if (!SendRpdo(1, controlword, false, mode_of_operation_.load())) {
+      throw std::runtime_error("RPDO1 transmit failed for node " + std::to_string(node_id_));
+    }
   } catch (const std::exception& ex) {
     LogError(Stage::S12_SERVO_ON, axis_tag_, Str("RPDO1 transmission failed: ", ex.what()));
     return false;
   }
-  if (WaitForState(expect, rpdo_budget)) {
-    controlword_path_.store(ControlwordPath::kRpdo);
-    controlword_time_ = std::chrono::steady_clock::now();
-    return true;
-  }
 
-  // Did the drive actually receive it? Reading 0x6040 back over SDO is the only way to
-  // tell "the frame never arrived" from "the drive applied it and refused to act".
-  // Captured on the bus: frames 0x201#060000 (CW=0x0006) and 0x201#0F0000 (CW=0x000F) were
-  // transmitted correctly, so this distinguishes a layout problem from a drive-side block.
-  const uint16_t cw_readback = ReadOr<uint16_t>(od::kControlword, 0, 0xFFFFu);
-  const bool drive_saw_it = (cw_readback != 0xFFFFu) && (cw_readback == controlword);
-  LogWarn(Stage::S12_SERVO_ON, axis_tag_,
-          Str("RPDO1 controlword produced no transition within ", rpdo_budget.count(),
-              " ms (still ", cia402_state_to_string(state_.load()),
-              "). Reading ", ObjRef(od::kControlword, 0), " back gives ", Hex(cw_readback, 4),
-              " versus the sent ", Hex(controlword, 4), " -> ",
-              drive_saw_it
-                  ? "the drive DID store the command, so it is refusing the transition on "
-                    "its own side, not a transport problem"
-                  : "the drive did NOT store the command, so the RPDO frame is not being "
-                    "applied (check the mapping byte order or a leading dummy byte)"));
+  if (WaitForState(expect, timeout)) return true;
 
-  // ---- path 2: SDO fallback ----
-  // The drive ignored CW over PDO. Repeating the identical command over SDO separates
-  // "the frame never arrived" from "the drive refuses this transition".
-  if (!sdo_controlword_fallback_) {
-    LogError(Stage::S12_SERVO_ON, axis_tag_,
-             Str("RPDO1 controlword had no effect and the SDO fallback is disabled "
-                 "(--no-sdo-fallback), so the RPDO transmit path cannot be confirmed working"));
-    controlword_path_.store(ControlwordPath::kNone);
-    return false;
-  }
-  LogWarn(Stage::S12_SERVO_ON, axis_tag_,
-          Str("RPDO1 controlword produced no transition within ", rpdo_budget.count(),
-              " ms (still ", cia402_state_to_string(state_.load()),
-              "); repeating the same command over SDO to ", ObjRef(od::kControlword, 0),
-              " to tell the two cases apart"));
-
-  std::string why;
-  if (!TryWrite<uint16_t>(od::kControlword, 0, controlword, &why)) {
-    LogError(Stage::S12_SERVO_ON, axis_tag_,
-             Str("SDO write of the controlword also failed: ", why));
-    controlword_path_.store(ControlwordPath::kNone);
-    return false;
-  }
-  if (WaitForState(expect, sdo_budget)) {
-    controlword_path_.store(ControlwordPath::kSdo);
-    controlword_time_ = std::chrono::steady_clock::now();
-    LogWarn(Stage::S12_SERVO_ON, axis_tag_,
-            Str("SDO worked but RPDO did not -> the RPDO transmit path is not delivering "
-                "frames to the drive. The drive is CiA 402 capable, so the cause is in the "
-                "PDO configuration or the CAN wiring, not in the drive."));
-    return true;
-  }
-
-  controlword_path_.store(ControlwordPath::kNone);
+  // Reading 0x6040 back is the only way to tell "the frame never arrived" from "the
+  // drive applied it and refused to act": an unchanged value proves the RPDO did not
+  // reach the object dictionary at all.
+  const uint16_t readback = ReadOr<uint16_t>(od::kControlword, 0, 0xFFFFu);
+  const bool applied = readback != 0xFFFFu && readback == controlword;
   LogError(Stage::S12_SERVO_ON, axis_tag_,
-           Str("neither RPDO nor SDO moved the drive out of ",
-               cia402_state_to_string(state_.load()),
-               ". The command is reaching the object dictionary but the drive refuses the "
-               "transition, so the block is inside the drive."));
+           Str("RPDO1 controlword produced no transition within ", timeout.count(),
+               " ms (still ", cia402_state_to_string(state_.load()), "). Reading ",
+               ObjRef(od::kControlword, 0), " back gives ", Hex(readback, 4), " versus the sent ",
+               Hex(controlword, 4), " -> ",
+               applied
+                   ? "the drive DID store the command, so it refuses the transition on its own "
+                     "side (check the digital inputs, STO and 0x603F/0x200F)"
+                   : "the drive did NOT store the command, so the RPDO frame is not being "
+                     "applied at all - check the 0x1400/0x1600 mapping and the CAN wiring"));
   return false;
 }
 
@@ -1068,10 +1329,24 @@ bool MbdvAxisDriver::EnableServoImpl(std::chrono::milliseconds timeout) {
           Str("current status ", DecodeStatusword(statusword_.load()), " | telemetry frames=",
               statusword_count_.load(), TelemetryStaleNote()));
 
+  // The drive keeps 0x60FF from before the servo was last switched off - a reconnect or a
+  // fault recovery re-enables it on whatever was commanded then - so zero it over SDO
+  // first: Enable Operation must never start the motor on an old setpoint, and an axis
+  // found still enabled after a reconnect must not keep running on one either.
+  {
+    std::string why;
+    if (!TryWrite<int32_t>(od::kTargetVelocity, 0, int32_t{0}, &why)) {
+      LogWarn(stage, axis_tag_,
+              Str("could not zero ", ObjRef(od::kTargetVelocity, 0), " before enabling: ", why));
+    }
+    last_target_velocity_.store(0);
+  }
+
   if (state_.load() == CiA402State::OPERATION_ENABLED) {
     LogInfo(stage, axis_tag_, "already in OPERATION_ENABLED, nothing to do");
     return true;
   }
+  halted_.store(false);  // a fresh enable starts without StopNow()'s Halt
 
   struct Transition {
     uint16_t controlword;
@@ -1098,7 +1373,6 @@ bool MbdvAxisDriver::EnableServoImpl(std::chrono::milliseconds timeout) {
                Str("S12.", static_cast<int>(step_no), " ", step.label,
                    " did not complete; drive is in ", cia402_state_to_string(state_.load()),
                    " | Statusword ", DecodeStatusword(snap.statusword),
-                   " | controlword path = ", controlword_path_to_string(GetControlwordPath()),
                    " | TPDO frames=", statusword_count_.load(),
                    FormatDriveSnapshot(snap)));
       return false;
@@ -1110,7 +1384,6 @@ bool MbdvAxisDriver::EnableServoImpl(std::chrono::milliseconds timeout) {
 
   LogInfo(stage, axis_tag_,
           Str("Servo ON complete: ", DecodeStatusword(statusword_.load()),
-              " | controlword path = ", controlword_path_to_string(GetControlwordPath()),
               " | TPDO frames=", statusword_count_.load(),
               " | SDO statusword reads=", statusword_sdo_reads_.load()));
   return true;
@@ -1125,9 +1398,7 @@ bool MbdvAxisDriver::EnableServoStaged(DiagnosticReport& report, std::chrono::mi
       const bool ok = EnableServoImpl(timeout);
       if (ok) {
         report.Pass(Stage::S12_SERVO_ON, axis_tag_,
-                    Str("OPERATION_ENABLED, Statusword ", Hex(statusword_.load(), 4),
-                        ", controlword path = ", controlword_path_to_string(
-                                                      GetControlwordPath())));
+                    Str("OPERATION_ENABLED, Statusword ", Hex(statusword_.load(), 4)));
       } else {
         const DriveSnapshot snap = ReadDriveSnapshotImpl();
         const std::string reason = Str("stuck in ", cia402_state_to_string(state_.load()),
@@ -1196,10 +1467,17 @@ bool MbdvAxisDriver::DisableServoImpl(std::chrono::milliseconds timeout) {
 
   // Zero the velocity first so the drive is not commanded while decelerating.
   try {
-    tpdo_mapped[od::kTargetVelocity][0] = int32_t{0};
-    master.TpdoEvent();
+    SendRpdo(3, controlword_commands::ENABLE_OPERATION, true, 0);
   } catch (...) {
   }
+  // RPDO3 carries the controlword as well (0x000F). Sent back to back with RPDO1's 0x0007,
+  // the drive could apply them in either order; with 0x000F last the axis stays enabled -
+  // AX2 failed S15 that way on the bench, 0x6040 reading back 000F. Waiting for the ramp
+  // (at most 1 s) keeps the two frames apart and the stop controlled.
+  for (int i = 0; i < 100 && !abort_.load() && std::abs(actual_velocity_.load()) > 50; ++i) {
+    USleep(10000);
+  }
+  USleep(20000);
 
   bool ok = ApplyControlword(controlword_commands::DISABLE_OPERATION, CiA402State::SWITCHED_ON,
                              timeout);
@@ -1262,6 +1540,8 @@ bool MbdvAxisDriver::MoveToPositionImpl(int32_t target, std::chrono::millisecond
                  " but Operation Enabled is required"));
     return false;
   }
+  // An explicit position command is what releases a Halt set by StopNow().
+  halted_.store(false);
 
   // Statusword bit 10 (Target reached) is often ALREADY set on an idle drive, so clearing
   // the cached flag is not enough - it is re-armed from a fresh Statusword read below.
@@ -1275,13 +1555,13 @@ bool MbdvAxisDriver::MoveToPositionImpl(int32_t target, std::chrono::millisecond
               target_reached_before ? "ALREADY SET (will be ignored)" : "clear"));
 
   try {
-    tpdo_mapped[od::kTargetPosition][0] = target;
     // bit 4 new setpoint + bit 5 change immediately, keeping bit 3 enable operation.
-    tpdo_mapped[od::kControlword][0] =
-        static_cast<uint16_t>(controlword_commands::ENABLE_OPERATION |
-                              controlword_bits::NEW_SET_POINT |
-                              controlword_bits::CHANGE_SET_IMMEDIATELY);
-    master.TpdoEvent();
+    const uint16_t cw = static_cast<uint16_t>(controlword_commands::ENABLE_OPERATION |
+                                              controlword_bits::NEW_SET_POINT |
+                                              controlword_bits::CHANGE_SET_IMMEDIATELY);
+    if (!SendRpdo(2, cw, true, target)) {
+      throw std::runtime_error("RPDO2 transmit failed for node " + std::to_string(node_id_));
+    }
   } catch (const std::exception& ex) {
     LogError(cmd, axis_tag_, Str("RPDO2 transmission failed: ", ex.what()));
     return false;
@@ -1290,30 +1570,8 @@ bool MbdvAxisDriver::MoveToPositionImpl(int32_t target, std::chrono::millisecond
   // Release the new-setpoint edge so later cycles are not seen as new setpoints.
   USleep(20000);
   try {
-    tpdo_mapped[od::kControlword][0] = controlword_commands::ENABLE_OPERATION;
-    master.TpdoEvent();
+    SendRpdo(2, controlword_commands::ENABLE_OPERATION, true, target);
   } catch (...) {
-  }
-
-  // Some drive firmwares receive TPDOs but ignore RPDOs (measured on this MBDV-2X-520AC).
-  // When asked to, deliver the setpoint over SDO instead, which the drive does honour.
-  if (sdo_setpoints_.load()) {
-    ++sdo_setpoint_count_;
-    std::string why;
-    const uint16_t cw = static_cast<uint16_t>(controlword_commands::ENABLE_OPERATION |
-                                              controlword_bits::NEW_SET_POINT |
-                                              controlword_bits::CHANGE_SET_IMMEDIATELY);
-    if (!TryWrite<int32_t>(od::kTargetPosition, 0, target, &why) ||
-        !TryWrite<uint16_t>(od::kControlword, 0, cw, &why)) {
-      LogError(cmd, axis_tag_, Str("SDO setpoint to ", ObjRef(od::kTargetPosition, 0),
-                                   " failed: ", why));
-      return false;
-    }
-    USleep(20000);
-    TryWrite<uint16_t>(od::kControlword, 0, controlword_commands::ENABLE_OPERATION, nullptr);
-    LogInfo(cmd, axis_tag_,
-            Str("setpoint delivered over SDO (--sdo-setpoints), count=",
-                sdo_setpoint_count_.load()));
   }
 
   // ---- S14: wait for Target Reached, abort early on FAULT ----
@@ -1413,27 +1671,18 @@ bool MbdvAxisDriver::SetVelocityImpl(int32_t target, std::chrono::milliseconds s
     return false;
   }
 
+  // RefreshControlword() re-sends last_target_velocity_ at 20 Hz; without this it would
+  // overwrite the staged setpoint with the previous one (0 after enable in --test-velocity).
+  last_target_velocity_.store(target);
   LogInfo(cmd, axis_tag_,
           Str("RPDO3 target velocity = ", target, " counts/s; actual = ", actual_velocity_.load()));
   try {
-    tpdo_mapped[od::kTargetVelocity][0] = target;
-    tpdo_mapped[od::kControlword][0] = controlword_commands::ENABLE_OPERATION;
-    master.TpdoEvent();
+    if (!SendRpdo(3, controlword_commands::ENABLE_OPERATION, true, target)) {
+      throw std::runtime_error("RPDO3 transmit failed for node " + std::to_string(node_id_));
+    }
   } catch (const std::exception& ex) {
     LogError(cmd, axis_tag_, Str("RPDO3 transmission failed: ", ex.what()));
     return false;
-  }
-
-  if (sdo_setpoints_.load()) {
-    ++sdo_setpoint_count_;
-    std::string why;
-    if (!TryWrite<int32_t>(od::kTargetVelocity, 0, target, &why)) {
-      LogError(cmd, axis_tag_, Str("SDO setpoint to ", ObjRef(od::kTargetVelocity, 0),
-                                   " failed: ", why));
-      return false;
-    }
-    LogInfo(cmd, axis_tag_, Str("velocity delivered over SDO (--sdo-setpoints), count=",
-                                sdo_setpoint_count_.load()));
   }
 
   // Let the loop ramp, then verify the feedback is heading the right way.
@@ -1564,6 +1813,21 @@ DriveSnapshot MbdvAxisDriver::ReadDriveSnapshotImpl() {
   snap.watchdog_status = ReadOr<uint32_t>(od::kCommWatchdog, od::kCommWatchdogStatus, 0u);
   snap.watchdog_timeout_ms = ReadOr<uint32_t>(od::kCommWatchdog, od::kCommWatchdogTimeout, 0u);
   snap.watchdog_trigger = ReadOr<uint32_t>(od::kCommWatchdog, od::kCommWatchdogTrigger, 0u);
+  // Motion limits: the reason a drive can sit in Operation Enabled forever while
+  // ignoring every target position.
+  {
+    const uint32_t vmax = ReadOr<uint32_t>(od::kMaxProfileSpeed, 0, 0u);
+    const uint32_t acc = ReadOr<uint32_t>(od::kProfileAcceleration, 0, 0u);
+    const uint32_t dec = ReadOr<uint32_t>(od::kProfileDeceleration, 0, 0u);
+    const int32_t lo = ReadOr<int32_t>(od::kSoftwarePositionLimit, 1, 0);
+    const int32_t hi = ReadOr<int32_t>(od::kSoftwarePositionLimit, 2, 0);
+    snap.max_profile_speed = vmax;
+    snap.profile_accel = acc;
+    snap.profile_decel = dec;
+    snap.position_limit_min = lo;
+    snap.position_limit_max = hi;
+    snap.motion_limits_valid = true;
+  }
   snap.inputs.raw = ReadOr<uint32_t>(od::kDigitalInputs, 0, 0u);
   for (uint8_t i = 0; i < 4; ++i) {
     snap.inputs.function[i] = ReadOr<uint32_t>(od::kInputConfig, static_cast<uint8_t>(i + 1), 0u);
@@ -1591,161 +1855,57 @@ DriveSnapshot MbdvAxisDriver::ReadDriveSnapshot() {
 // Unstaged helpers
 // ---------------------------------------------------------------------------
 
-void MbdvAxisDriver::RequestNmtStart() {
-  LogInfo(Stage::S07_NMT_START, axis_tag_, "NMT Start Remote Node (CS=0x01)");
-  master.Command(lely::canopen::NmtCommand::START, id());
-}
-
-void MbdvAxisDriver::RequestNmtPreOp() {
-  master.Command(lely::canopen::NmtCommand::ENTER_PREOP, id());
-}
-
-void MbdvAxisDriver::RequestNmtReset() {
-  master.Command(lely::canopen::NmtCommand::RESET_NODE, id());
-}
-
-void MbdvAxisDriver::SetModeOfOperation(CiA402Mode mode) {
-  Defer([this, mode]() {
-    LogInfo(Stage::S10_MODE_OF_OPERATION, axis_tag_,
-            Str("writing 0x6060 = ", static_cast<int>(mode)));
-    std::string why;
-    if (!TryWrite<int8_t>(od::kModeOfOperation, 0, static_cast<int8_t>(mode), &why)) {
-      LogWarn(Stage::S10_MODE_OF_OPERATION, axis_tag_, Str("SDO write 0x6060 failed: ", why));
-      return;
-    }
-    try {
-      tpdo_mapped[od::kModeOfOperation][0] = static_cast<int8_t>(mode);
-      master.TpdoEvent();
-    } catch (...) {
-    }
-  });
-}
-
-void MbdvAxisDriver::SendControlword(uint16_t controlword) {
-  Defer([this, controlword]() {
-    LogDebug(Stage::S12_SERVO_ON, axis_tag_,
-             Str("Controlword = ", DecodeControlword(controlword)));
-    try {
-      tpdo_mapped[od::kControlword][0] = controlword;
-      master.TpdoEvent();
-    } catch (const std::exception& ex) {
-      LogError(Stage::S12_SERVO_ON, axis_tag_,
-               Str("RPDO1 transmission failed: ", ex.what()));
-    }
-  });
-}
-
 void MbdvAxisDriver::SendControlwordQuiet(uint16_t controlword) {
-  Defer([this, controlword]() {
-    try {
-      tpdo_mapped[od::kControlword][0] = controlword;
-      master.TpdoEvent();
-    } catch (...) {
-    }
-  });
-}
-
-void MbdvAxisDriver::ResetFault() {
-  Defer([this]() {
-    LogInfo(Stage::S11_FAULT_RESET, axis_tag_,
-            Str("fault reset; Statusword ", DecodeStatusword(statusword_.load())));
-    try {
-      tpdo_mapped[od::kControlword][0] = controlword_commands::FAULT_RESET;
-      master.TpdoEvent();
-    } catch (...) {
-    }
-    USleep(50000);
-    try {
-      tpdo_mapped[od::kControlword][0] = controlword_commands::DISABLE_VOLTAGE;
-      master.TpdoEvent();
-    } catch (...) {
-    }
-  });
-}
-
-void MbdvAxisDriver::QuickStop() {
-  Defer([this]() {
-    LogWarn(Stage::S15_SERVO_OFF, axis_tag_, "Quick Stop (CW=0x0002)");
-    try {
-      tpdo_mapped[od::kControlword][0] = controlword_commands::QUICK_STOP;
-      master.TpdoEvent();
-    } catch (...) {
-    }
-  });
-}
-
-bool MbdvAxisDriver::EnableServo(std::chrono::milliseconds timeout) {
-  auto promise = std::make_shared<std::promise<bool>>();
-  auto future = promise->get_future();
-  Defer([this, timeout, promise]() {
-    try {
-      promise->set_value(EnableServoImpl(timeout));
-    } catch (...) {
-      promise->set_value(false);
-    }
-  });
-  if (future.wait_for(timeout * 4 + std::chrono::milliseconds(2000)) ==
-      std::future_status::ready) {
-    return future.get();
+  // Sent at once: every caller already runs on this driver's strand, where a Defer() queued
+  // the frame behind the very task waiting for its effect. S15's forced Disable Voltage
+  // therefore went out only after the stage had failed, and after a recovery the parked
+  // 0x0000 would land after the re-enable and switch the axis back off.
+  try {
+    SendRpdo(1, controlword, false, CurrentModeForRpdo1());
+  } catch (...) {
   }
-  return false;
-}
-
-bool MbdvAxisDriver::DisableServo() {
-  auto promise = std::make_shared<std::promise<bool>>();
-  auto future = promise->get_future();
-  Defer([this, promise]() {
-    try {
-      promise->set_value(DisableServoImpl(std::chrono::milliseconds(1000)));
-    } catch (...) {
-      promise->set_value(false);
-    }
-  });
-  if (future.wait_for(std::chrono::milliseconds(4000)) == std::future_status::ready) {
-    return future.get();
-  }
-  return false;
-}
-
-void MbdvAxisDriver::SetTargetPosition(int32_t target_position, bool new_setpoint, bool immediate,
-                                       bool relative) {
-  Defer([this, target_position, new_setpoint, immediate, relative]() {
-    LogInfo(Stage::S13_MOTION_COMMAND, axis_tag_,
-            Str("target position = ", target_position, " (relative=",
-                relative ? "yes" : "no", ", immediate=", immediate ? "yes" : "no", ")"));
-    try {
-      tpdo_mapped[od::kTargetPosition][0] = target_position;
-      uint16_t cw = controlword_commands::ENABLE_OPERATION;
-      if (new_setpoint) cw |= controlword_bits::NEW_SET_POINT;
-      if (immediate) cw |= controlword_bits::CHANGE_SET_IMMEDIATELY;
-      if (relative) cw |= controlword_bits::ABS_REL;
-      tpdo_mapped[od::kControlword][0] = cw;
-      master.TpdoEvent();
-      if (new_setpoint) {
-        USleep(20000);
-        tpdo_mapped[od::kControlword][0] = controlword_commands::ENABLE_OPERATION;
-        master.TpdoEvent();
-      }
-    } catch (const std::exception& ex) {
-      LogError(Stage::S13_MOTION_COMMAND, axis_tag_,
-               Str("RPDO2 transmission failed: ", ex.what()));
-    }
-  });
 }
 
 void MbdvAxisDriver::SetTargetVelocity(int32_t target_velocity) {
+  // Checked before posting: at 200 Hz most cycles do not change the setpoint, and a
+  // queued task per cycle would fill the fiber strand for no benefit.
+  if (target_velocity == last_target_velocity_.load()) return;
+  last_target_velocity_.store(target_velocity);
+
   Defer([this, target_velocity]() {
-    if (target_velocity != last_target_velocity_.exchange(target_velocity)) {
-      LogInfo(Stage::S13_MOTION_COMMAND, axis_tag_,
-              Str("target velocity = ", target_velocity, " counts/s"));
-    }
+    // A newer setpoint - or a stop from StopNow()/ZeroVelocityNow(), which bypass the strand
+    // - may have been issued after this task was queued; sending this one would undo it.
+    if (last_target_velocity_.load() != target_velocity) return;
+    LogDebug(Stage::S13_MOTION_COMMAND, axis_tag_,
+             Str("target velocity = ", target_velocity, " counts/s"));
     try {
-      tpdo_mapped[od::kTargetVelocity][0] = target_velocity;
-      tpdo_mapped[od::kControlword][0] = controlword_commands::ENABLE_OPERATION;
-      master.TpdoEvent();
+      // RPDO3 only: it carries 0x60FF alongside the controlword, one frame at 200 Hz.
+      if (!SendRpdo(3, controlword_commands::ENABLE_OPERATION, true, target_velocity)) {
+        throw std::runtime_error("RPDO3 transmit failed for node " + std::to_string(node_id_));
+      }
     } catch (const std::exception& ex) {
       LogError(Stage::S13_MOTION_COMMAND, axis_tag_,
                Str("RPDO3 transmission failed: ", ex.what()));
+    }
+  });
+}
+
+void MbdvAxisDriver::RefreshControlword() {
+  Defer([this]() {
+    try {
+      if (mode_of_operation_.load() == static_cast<int8_t>(CiA402Mode::PROFILE_VELOCITY)) {
+        // RPDO3 carries the Controlword AND 0x60FF, so the same frame also re-sends the
+        // current setpoint. SetTargetVelocity() only transmits on a change, so without this a
+        // single lost frame - a lost stop included - would stand until the next change.
+        int32_t velocity = last_target_velocity_.load();
+        if (velocity == kNoSetpoint) velocity = 0;
+        SendRpdo(3, controlword_commands::ENABLE_OPERATION, true, velocity);
+      } else {
+        uint16_t cw = controlword_commands::ENABLE_OPERATION;
+        if (halted_.load()) cw |= controlword_bits::HALT;  // keep StopNow()'s Halt latched
+        SendRpdo(1, cw, false, CurrentModeForRpdo1());
+      }
+    } catch (...) {
     }
   });
 }
@@ -1761,55 +1921,14 @@ bool MbdvAxisDriver::SetDriveControlModeImpl(uint32_t p1_00_value) {
   LogInfo(Stage::S10_MODE_OF_OPERATION, axis_tag_,
           Str("0x2A30 read back ", static_cast<int>(readback), " -> ",
               drive_control_mode_to_string(readback)));
-
-  // Storing the whole parameter block over CAN right after modifying it is NOT done by
-  // default: a stored-parameter write that aborts part way (observed as SDO abort 0x08000020
-  // on 0x1010:01) can leave the block inconsistent, and after repeated --p1-00 runs 0x2A30
-  // was found reading the undocumented value 30 on BOTH axes. Persistence is therefore
-  // opt-in, and P1-00 is better set once in Luna than from this tool.
-  if (!store_parameters_) {
+  if (readback != p1_00_value) {
     LogWarn(Stage::S10_MODE_OF_OPERATION, axis_tag_,
-            "NOT saving parameters (0x1010:01). The value stays valid until the next power "
-            "cycle. Add --p1-00-save to persist it, or set P1-00 once in Luna.");
-    return readback == p1_00_value;
-  }
-
-  std::string save_why;
-  if (!TryWrite<uint32_t>(0x1010, 1, uint32_t{1}, &save_why)) {
-    LogError(Stage::S10_MODE_OF_OPERATION, axis_tag_,
-             Str("--p1-00-save: 0x1010:01 = 1 failed: ", save_why,
-                 ". The parameter block may be partly written - power-cycle the drive and "
-                 "verify 0x2A30 before trusting it."));
+            "NOT saving parameters (0x1010:01): a stored-parameter write that aborts part way "
+            "(observed as SDO abort 0x08000020) can leave the block inconsistent. The value "
+            "stays valid until the next power cycle; set P1-00 once in Luna to persist it.");
     return false;
   }
-  const uint32_t after_save = ReadOr<uint32_t>(od::kControlMode, 0, 0xFFFFFFFFu);
-  if (after_save != p1_00_value) {
-    LogError(Stage::S10_MODE_OF_OPERATION, axis_tag_,
-             Str("after saving, 0x2A30 reads ", static_cast<int>(after_save),
-                 " instead of ", static_cast<int>(p1_00_value),
-                 ". The stored parameter block looks inconsistent - power-cycle and check "
-                 "P1-00 in Luna."));
-    return false;
-  }
-  LogInfo(Stage::S10_MODE_OF_OPERATION, axis_tag_,
-          "parameters stored (0x1010:01 = 1) and 0x2A30 re-verified after the save");
   return true;
-}
-
-bool MbdvAxisDriver::SetDriveControlMode(uint32_t p1_00_value) {
-  auto promise = std::make_shared<std::promise<bool>>();
-  auto future = promise->get_future();
-  Defer([this, p1_00_value, promise]() {
-    try {
-      promise->set_value(SetDriveControlModeImpl(p1_00_value));
-    } catch (...) {
-      promise->set_value(false);
-    }
-  });
-  if (future.wait_for(std::chrono::milliseconds(3000)) == std::future_status::ready) {
-    return future.get();
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1818,6 +1937,11 @@ bool MbdvAxisDriver::SetDriveControlMode(uint32_t p1_00_value) {
 
 void MbdvAxisDriver::OnBoot(lely::canopen::NmtState st, char es, const std::string& what) noexcept {
   boot_seen_.store(true);
+  boot_in_progress_.store(false);  // lely's boot-slave process is over, whatever the outcome
+  {
+    std::lock_guard<std::mutex> lock(time_mutex_);
+    last_nmt_time_ = std::chrono::steady_clock::now();
+  }
   if (es) {
     LogError(Stage::S05_BOOTUP, axis_tag_,
              Str("boot-up / SDO configuration FAILED with error ", static_cast<int>(es), ": ",
@@ -1830,6 +1954,14 @@ void MbdvAxisDriver::OnBoot(lely::canopen::NmtState st, char es, const std::stri
 }
 
 void MbdvAxisDriver::OnState(lely::canopen::NmtState st) noexcept {
+  {
+    std::lock_guard<std::mutex> lock(time_mutex_);
+    last_nmt_time_ = std::chrono::steady_clock::now();
+    if (st == lely::canopen::NmtState::BOOTUP) boot_start_time_ = last_nmt_time_;
+  }
+  // A boot-up frame starts lely's boot-slave process (BasicMaster::OnState() has already
+  // cancelled our pending SDO requests for it); OnBoot() marks its end.
+  if (st == lely::canopen::NmtState::BOOTUP) boot_in_progress_.store(true);
   is_operational_.store(st == lely::canopen::NmtState::START);
 
   const char* name = "UNKNOWN";
@@ -1849,7 +1981,6 @@ void MbdvAxisDriver::OnConfig(::std::function<void(::std::error_code ec)> res) n
   // The base implementation starts the concise-DCF SDO download; it must run.
   // Wrapping the completion callback only observes the outcome.
   lely::canopen::BasicDriver::OnConfig([this, res](::std::error_code ec) {
-    config_done_.store(true);
     if (ec) {
       LogError(Stage::S09_PDO_VERIFY, axis_tag_,
                Str("concise-DCF download reported error ", ec.value(), " (", ec.message(),
@@ -1862,8 +1993,50 @@ void MbdvAxisDriver::OnConfig(::std::function<void(::std::error_code ec)> res) n
   });
 }
 
+void MbdvAxisDriver::HandleRawTpdo(uint8_t pdo_no, const uint8_t* data, uint8_t len) {
+  try {
+    if (data == nullptr) return;
+    const auto u16 = [data](uint8_t off) -> uint16_t {
+      return static_cast<uint16_t>(data[off] | (static_cast<uint16_t>(data[off + 1]) << 8));
+    };
+    const auto u32 = [data](uint8_t off) -> uint32_t {
+      return static_cast<uint32_t>(data[off]) |
+             (static_cast<uint32_t>(data[off + 1]) << 8) |
+             (static_cast<uint32_t>(data[off + 2]) << 16) |
+             (static_cast<uint32_t>(data[off + 3]) << 24);
+    };
+    if (pdo_no == 1 && len >= 2) {
+      RefreshStateFromStatusword(u16(0));
+      ++statusword_count_;
+    } else if (pdo_no == 2 && len >= 8) {
+      actual_position_.store(static_cast<int32_t>(u32(0)));
+      actual_velocity_.store(static_cast<int32_t>(u32(4)));
+    } else if (pdo_no == 2 && len >= 4) {
+      actual_position_.store(static_cast<int32_t>(u32(0)));
+    } else if (pdo_no == 3 && len >= 8) {
+      const uint16_t code = static_cast<uint16_t>(u32(0) & 0xFFFFu);
+      const uint16_t previous = error_code_.exchange(code);
+      if (code != 0 && code != previous) {
+        LogError(Stage::S14_MOTION_TRACKING, axis_tag_,
+                 Str("live CiA 402 error code from TPDO3: ", DecodeErrorCode402(code)));
+      }
+      const uint32_t alarm = u32(4);
+      const uint32_t prev_alarm = dsp_alarm_.exchange(alarm);
+      if (alarm != 0 && alarm != prev_alarm) {
+        LogError(Stage::S14_MOTION_TRACKING, axis_tag_,
+                 Str("live drive alarm from TPDO3: ", DecodeDspAlarmCode(alarm)));
+      }
+    }
+  } catch (const std::exception&) {
+    // A frame too short to hold the mapped payload: nothing to decode.
+  }
+}
+
 void MbdvAxisDriver::OnRpdoWrite(uint16_t idx, uint8_t subidx) noexcept {
   (void)subidx;
+  // Once the sniffer feeds this axis, the object dictionary is shared between both nodes
+  // and would mix their values in; the per-frame decode above is authoritative.
+  if (raw_feedback_.load()) return;
   try {
     if (idx == od::kStatusword) {
       const uint16_t sw = rpdo_mapped[idx][0];
@@ -1889,11 +2062,23 @@ void MbdvAxisDriver::OnRpdoWrite(uint16_t idx, uint8_t subidx) noexcept {
         LogError(Stage::S14_MOTION_TRACKING, axis_tag_,
                  Str("live drive alarm from TPDO3: ", DecodeDspAlarmCode(alarm)));
       }
-    } else if (idx == od::kModeOfOperationDisplay) {
-      mode_display_.store(rpdo_mapped[idx][0]);
     }
   } catch (const std::exception&) {
     // A mapped object that has not arrived yet: nothing to decode.
+  }
+}
+
+void MbdvAxisDriver::OnHeartbeat(bool occurred) noexcept {
+  // Driven by lely's heartbeat consumer, so this reflects real 0x700+node frames: a
+  // timeout means the node genuinely stopped answering, not that a timer expired.
+  heartbeat_lost_.store(occurred);
+  ++heartbeat_events_;
+  if (occurred) {
+    LogError(Stage::S12_SERVO_ON, axis_tag_,
+             Str("heartbeat LOST: no 0x700+node frame within ",
+                 heartbeat_consumer_ms_.load(), " ms. The node is treated as gone."));
+  } else {
+    LogInfo(Stage::S12_SERVO_ON, axis_tag_, "heartbeat resumed: the node is answering again");
   }
 }
 
@@ -1928,14 +2113,18 @@ void MbdvAxisDriver::OnEmcy(uint16_t eec, uint8_t er, uint8_t msef[5]) noexcept 
   });
 }
 
-void MbdvAxisDriver::OnHeartbeat(bool occurred) noexcept {
-  if (occurred) heartbeat_seen_.store(true);
-}
 
 void MbdvAxisDriver::OnCanError(lely::io::CanError error) noexcept {
+  can_error_.store(true);
+  {
+    std::lock_guard<std::mutex> lock(time_mutex_);
+    last_can_error_ = Str("CAN controller error ", static_cast<int>(error), " at ",
+                          std::chrono::steady_clock::now().time_since_epoch().count());
+  }
   LogError(Stage::S02_CAN_LINK, axis_tag_,
            Str("CAN controller error code ", static_cast<int>(error),
-               " - check the physical CAN layer (wiring, terminator, bit rate)"));
+               " - check the physical CAN layer (wiring, terminator, bit rate). The "
+               "supervisor will re-open the interface if reconnect.recover_can_link is on."));
 }
 
 }  // namespace mbdv

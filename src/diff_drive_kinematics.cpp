@@ -38,6 +38,11 @@ WheelSpeeds DiffDriveKinematics::ComputeWheelSpeeds(double linear_v,
   return speeds;
 }
 
+void DiffDriveKinematics::SetConfig(const KinematicsConfig& config) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  config_ = config;
+}
+
 void DiffDriveKinematics::UpdateOdometryFromTicks(int32_t left_ticks,
                                                 int32_t right_ticks,
                                                 double dt_sec) {
@@ -50,8 +55,12 @@ void DiffDriveKinematics::UpdateOdometryFromTicks(int32_t left_ticks,
     return;
   }
 
-  int32_t delta_left_ticks = left_ticks - prev_left_ticks_;
-  int32_t delta_right_ticks = right_ticks - prev_right_ticks_;
+  // Differenced in unsigned arithmetic: 0x6064 wraps at +/-2^31 and a signed subtraction
+  // across the wrap is undefined behaviour; the modulo-2^32 result is the true delta.
+  const int32_t delta_left_ticks = static_cast<int32_t>(static_cast<uint32_t>(left_ticks) -
+                                                        static_cast<uint32_t>(prev_left_ticks_));
+  const int32_t delta_right_ticks = static_cast<int32_t>(static_cast<uint32_t>(right_ticks) -
+                                                         static_cast<uint32_t>(prev_right_ticks_));
 
   prev_left_ticks_ = left_ticks;
   prev_right_ticks_ = right_ticks;
@@ -74,11 +83,16 @@ void DiffDriveKinematics::UpdateOdometryFromTicks(int32_t left_ticks,
   pose_.y += d_s * std::sin(mid_theta);
   pose_.theta = NormalizeAngle(pose_.theta + d_theta);
 
-  // Velocity derivation
-  if (dt_sec > 1e-4) {
-    twist_.linear_v = d_s / dt_sec;
-    twist_.angular_w = d_theta / dt_sec;
-  }
+  // No velocity from these deltas: at the loop rate they alias against the TPDO2 period
+  // (some cycles see no new frame, the next sees two), so the twist comes from the drives'
+  // own velocity feedback instead - see UpdateTwistFromSpeeds().
+  (void)dt_sec;
+}
+
+void DiffDriveKinematics::UpdateTwistFromSpeeds(int32_t left_driver_vel,
+                                                int32_t right_driver_vel) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  twist_ = ComputeRobotTwistFromSpeeds(left_driver_vel, right_driver_vel);
 }
 
 RobotTwist DiffDriveKinematics::ComputeRobotTwistFromSpeeds(
@@ -111,6 +125,17 @@ void DiffDriveKinematics::ResetPose(double x, double y, double theta) {
   pose_.x = x;
   pose_.y = y;
   pose_.theta = NormalizeAngle(theta);
+  first_run_ = true;
+}
+
+void DiffDriveKinematics::Realign(int32_t left_ticks, int32_t right_ticks) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  pose_ = RobotPose{0.0, 0.0, 0.0};
+  twist_ = RobotTwist{0.0, 0.0};
+  // first_run_ is what makes the next UpdateOdometryFromTicks() re-baseline instead of
+  // integrating the jump between the old and the reconnected encoder reading.
+  prev_left_ticks_ = left_ticks;
+  prev_right_ticks_ = right_ticks;
   first_run_ = true;
 }
 

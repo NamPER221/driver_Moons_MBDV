@@ -29,6 +29,7 @@ constexpr uint16_t kSoftwareVersion = 0x100A;    ///< VISIBLE_STRING
 constexpr uint16_t kIdentity = 0x1018;           ///< Identity (ro)
 
 // --- CiA 402 drive profile ---
+constexpr uint16_t kProducerHeartbeatTime = 0x1017;  ///< UNSIGNED16, rw - broadcast period
 constexpr uint16_t kErrorCode = 0x603F;          ///< UNSIGNED16, PDO-mappable
 constexpr uint16_t kControlword = 0x6040;        ///< UNSIGNED16
 constexpr uint16_t kStatusword = 0x6041;         ///< UNSIGNED16, PDO-mappable
@@ -41,6 +42,13 @@ constexpr uint16_t kFollowingError = 0x60F4;     ///< INTEGER32
 constexpr uint16_t kCurrentActual = 0x6078;      ///< INTEGER16
 constexpr uint16_t kDigitalInputs = 0x60FD;       ///< UNSIGNED32 (ro), PDO-mappable
 constexpr uint16_t kTargetVelocity = 0x60FF;     ///< INTEGER32
+// CiA 402 motion limits. In Profile Position a drive can be Operation Enabled and
+// still refuse every setpoint when these are zero, so they belong in the snapshot
+// next to the statusword: without them "the motor never moves" has no explanation.
+constexpr uint16_t kSoftwarePositionLimit = 0x607D;///< ARRAY, sub 1 = min, sub 2 = max (INTEGER32)
+constexpr uint16_t kMaxProfileSpeed = 0x607F;      ///< UNSIGNED32
+constexpr uint16_t kProfileAcceleration = 0x6083;  ///< UNSIGNED32
+constexpr uint16_t kProfileDeceleration = 0x6084; ///< UNSIGNED32
 constexpr uint16_t kSupportedDriveModes = 0x6502;  ///< UNSIGNED32
 constexpr uint16_t kInputConfig = 0x2A20;        ///< ARRAY, sub 1..10 = P5-00.. (rw)
 
@@ -62,6 +70,7 @@ constexpr uint8_t kCommWatchdogEnable = 1;       ///< rww, EDS default 0 (disabl
 constexpr uint8_t kCommWatchdogStatus = 2;       ///< ro, non-zero once it has triggered
 constexpr uint8_t kCommWatchdogTimeout = 3;      ///< rw, EDS default 0x1F4 = 500 ms
 constexpr uint8_t kCommWatchdogTrigger = 4;      ///< rw, bitmask of triggering events
+constexpr uint8_t kCommWatchdogOption = 5;       ///< rw, timeout option code (Luna P1-40)
 constexpr uint16_t kSwitchValue = 0x2070;        ///< UNSIGNED32 (ro)  <- DIP switches
 constexpr uint16_t kControlMode = 0x2A30;        ///< UNSIGNED32 (rw)  <- P1-00 CM
 constexpr uint16_t kControlModePowerUp = 0x2A31; ///< UNSIGNED32 (rw)  <- P1-02 PM
@@ -214,12 +223,55 @@ struct DriveSnapshot {
   uint16_t dc_bus_raw{0};       ///< 0x2030 raw UNSIGNED16 (scale not in the EDS)
   int16_t current_actual{0};    ///< 0x6078
   int32_t following_error{0};   ///< 0x60F4
+  uint32_t max_profile_speed{0};   ///< 0x607F - 0 means no profile motion is possible
+  uint32_t profile_accel{0};       ///< 0x6083
+  uint32_t profile_decel{0};       ///< 0x6084
+  int32_t position_limit_min{0};   ///< 0x607D:01
+  int32_t position_limit_max{0};   ///< 0x607D:02
+  bool motion_limits_valid{false}; ///< false when the reads failed
   DigitalInputState inputs{};  ///< 0x60FD + 0x2A20:01..04
   uint32_t watchdog_enable{0};    ///< 0x2060:01
   uint32_t watchdog_status{0};     ///< 0x2060:02, non-zero = has triggered
   uint32_t watchdog_timeout_ms{0}; ///< 0x2060:03
   uint32_t watchdog_trigger{0};    ///< 0x2060:04
 };
+
+/**
+ * @brief Why a drive refuses to enable, as far as CANopen can tell.
+ *
+ * The distinction matters operationally: kSto and kLimit are cleared by *hardware* (an
+ * operator refitting the STO connector on CN5, or releasing the CW/CCW limit input), so
+ * no amount of retrying from software will help. Everything else is at least worth
+ * retrying, and auto-recovery is attempted for those.
+ */
+enum class FaultKind : int {
+  kNone = 0,
+  kSto,        ///< STO engaged. Manual 4.11: a hardwired safety function, not clearable
+               ///< in software - the SF1/SF2 inputs on CN5 must be closed again.
+  kLimit,      ///< A CW/CCW limit or E-STOP digital input is asserted (0x60FD / 0x2A20).
+  kNoMainPower,///< Statusword bit 4 clear: nothing on V+/V- (manual 4.3 wants 24..60 VDC).
+  kEncoder,    ///< Encoder feedback missing or implausible.
+  kOverload,   ///< Overload / over-current class alarm (0x603F, 0x200F).
+  kPositionError,  ///< Excessive following error (0x60F4).
+  kCommunication,  ///< EMCY with error-register bit 4 set.
+  kUnknown,
+};
+
+/// Short stable name for @p kind, for logs and reports.
+const char* fault_kind_to_string(FaultKind kind) noexcept;
+
+/**
+ * @brief Classifies a fault from a drive snapshot.
+ *
+ * Nothing here is a guess about the EDS: each branch is tied to a documented signal -
+ * Statusword bit 4 for main power, 0x60FD/0x2A20 for the inputs, the error register for
+ * communication - and the manufacturer alarm 0x200F is reported as the raw rNN code the
+ * front LED shows rather than being mapped to a name the EDS does not publish.
+ */
+FaultKind ClassifyFault(const DriveSnapshot& snapshot);
+
+/// One-line human explanation of @p kind, including what a human has to do about it.
+std::string ExplainFaultKind(FaultKind kind);
 
 /**
  * @brief DC-bus limits from manual section 4.3.

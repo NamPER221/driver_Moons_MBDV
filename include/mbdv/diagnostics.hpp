@@ -108,7 +108,6 @@ struct StageOutcome {
   StageStatus status{StageStatus::PENDING};
   std::string reason;    ///< Short factual reason (always set, also on PASS)
   std::string hint;      ///< Actionable remediation hint (usually only on FAIL)
-  std::chrono::milliseconds elapsed{0};
 };
 
 // ---------------------------------------------------------------------------

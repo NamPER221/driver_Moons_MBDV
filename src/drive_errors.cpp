@@ -315,8 +315,14 @@ std::string DescribeDipSwitch(const DipSwitchDecode& dip) {
   std::ostringstream os;
   os << "SW1..SW3=" << static_cast<int>(dip.node1_raw) << " SW4..SW6="
      << static_cast<int>(dip.node2_raw);
-  if (dip.node1_raw == 0) {
-    os << " (axis1 node-ID comes from the Luna software setting, not the DIP)";
+  // 0x2070 is one bitmap for the whole drive, so both nodes report the same value. A zero
+  // address field is valid: that axis takes its node-ID from Luna, and 0x2020 stays the
+  // authoritative node-ID.
+  if (dip.node1_raw == 0 && dip.node2_raw == 0) {
+    os << " (both node-IDs come from the Luna software setting, not the DIP)";
+  } else if (dip.node1_raw == 0 || dip.node2_raw == 0) {
+    os << " (axis " << (dip.node1_raw == 0 ? 1 : 2)
+       << " node-ID comes from the Luna software setting, not the DIP)";
   }
   // SW7 = 0 means "bit rate is set by the Luna software (P1-18)", whose default happens to
   // be 1 Mbps - it does NOT mean the drive is running at 1 Mbps. Object 0x2021 is the
@@ -447,6 +453,127 @@ std::string DescribeCommWatchdog(uint32_t enable, uint32_t status, uint32_t time
   return os.str();
 }
 
+const char* fault_kind_to_string(FaultKind kind) noexcept {
+  switch (kind) {
+    case FaultKind::kNone:          return "none";
+    case FaultKind::kSto:           return "STO engaged";
+    case FaultKind::kLimit:         return "limit/E-STOP input asserted";
+    case FaultKind::kNoMainPower:   return "no main power on V+/V-";
+    case FaultKind::kEncoder:       return "encoder feedback";
+    case FaultKind::kOverload:      return "overload / over-current";
+    case FaultKind::kPositionError: return "excessive following error";
+    case FaultKind::kCommunication: return "CAN communication error";
+    case FaultKind::kUnknown:       return "unclassified";
+  }
+  return "unclassified";
+}
+
+std::string ExplainFaultKind(FaultKind kind) {
+  switch (kind) {
+    case FaultKind::kNone:
+      return "no fault";
+    case FaultKind::kSto:
+      return
+          "STO is engaged. Manual 4.11 calls it \"a hardware level safety function\": it is "
+          "armed by the SF1/SF2 inputs on connector CN5 going OPEN, and no CANopen object "
+          "can release it. Manual 4.11.1(7) states the alarm clears by itself once STO is "
+          "deactivated, so this program will recover on its own as soon as the safety "
+          "circuit is closed again - an operator has to refit the connector or close the "
+          "safety relay. Do NOT try to work around this in software.";
+    case FaultKind::kLimit:
+      return
+          "a digital input assigned to a blocking function (CW-LMT, CCW-LMT or E-STOP) is "
+          "asserted. Check 0x60FD and 0x2A20:01..04 for which one. Release the switch, or "
+          "reassign the input to GPIN (0) via P5-00..P5-03 (manual 7.1.1.2).";
+    case FaultKind::kNoMainPower:
+      return
+          "Statusword bit 4 (Voltage_enabled, CiA 402) is clear, so the drive sees nothing "
+          "on V+/V-. Manual 4.3 requires 24..60 VDC there; the 24 VDC auxiliary supply on "
+          "24V/GND alone powers the logic but will not enable a servo.";
+    case FaultKind::kEncoder:
+      return
+          "encoder feedback is missing or implausible. Compare 0x6064 against the "
+          "commanded 0x607A, and check the encoder cable - manual 6.2 flags code r09 for "
+          "encoder wiring.";
+    case FaultKind::kOverload:
+      return
+          "an overload or over-current class alarm is latched. Decode 0x603F and 0x200F "
+          "above; check the load, the duty cycle and the torque limit P1-06.";
+    case FaultKind::kPositionError:
+      return
+          "excessive following error. 0x60F4 is the position error at the instant of the "
+          "fault; check for a mechanical obstruction, a stall, and the position error limit "
+          "P3-04.";
+    case FaultKind::kCommunication:
+      return
+          "the drive raised an EMERGENCY with error-register bit 4 (COMMUNICATION) set, "
+          "which on this drive is the communication watchdog 0x2060 firing roughly 500 ms "
+          "after the last RPDO. It was measured disabled, so look for a gap in the setpoint "
+          "stream.";
+    case FaultKind::kUnknown:
+      return
+          "the fault does not match any documented pattern. Decode 0x603F, 0x1001 and the "
+          "manufacturer 0x200F, and read the 2-digit code on the front LED against manual "
+          "appendix 1.";
+  }
+  return "unclassified";
+}
+
+FaultKind ClassifyFault(const DriveSnapshot& s) {
+  // The CiA 301 error register is the only normative source for the communication bit.
+  if (s.error_register & 0x10u) return FaultKind::kCommunication;
+
+  // Statusword bit 4 is the authoritative "is the drive powered" signal; a drive with no
+  // main voltage can never leave Switch On Disabled regardless of anything else.
+  if (!MainVoltagePresent(s.statusword)) return FaultKind::kNoMainPower;
+
+  // An asserted input whose assigned function blocks servo enable explains a refusal
+  // better than any alarm code, and it is the one cause an operator can clear.
+  for (int i = 0; i < 4; ++i) {
+    const bool active = (s.inputs.raw >> i) & 0x01u;
+    if (active && InputFunctionBlocksServo(s.inputs.function[i])) {
+      return FaultKind::kLimit;
+    }
+  }
+
+  // 0x200F is the manufacturer's alarm; only its low byte is confirmed to be the code the
+  // front LED flashes, so the comparisons below are on that byte and are deliberately
+  // conservative. Codes outside this list fall through to kUnknown rather than being
+  // guessed at, because the EDS publishes no code-to-name table.
+  const uint32_t led = s.dsp_alarm & 0xFFu;
+  switch (led) {
+    case 0x09:  // manual 6.2: encoder cable / wiring
+      return FaultKind::kEncoder;
+    case 0x0A:
+    case 0x0B:
+    case 0x0C:
+      return FaultKind::kEncoder;
+    default:
+      break;
+  }
+
+  // 0x603F overload / over-current family (CiA 402 standard error codes).
+  switch (s.error_code) {
+    case 0x2311:  // continuous over current
+    case 0x2312:  // short circuit / earth leakage
+    case 0x2313:  // over current at output
+    case 0x3210:  // DC link over-voltage
+    case 0x3220:  // DC link under-voltage
+      return FaultKind::kOverload;
+    case 0x8611:  // following error
+      return FaultKind::kPositionError;
+    default:
+      break;
+  }
+
+  // A fault with no main voltage indication, no blocking input and no recognised code is
+  // most often the STO circuit on this drive family, because STO raises an alarm the
+  // vendor does not describe in the EDS. Reported as kUnknown unless the operator
+  // confirms it, so the log never claims a hardware safety state it cannot see.
+  if (s.dsp_alarm != 0 || s.error_code != 0) return FaultKind::kUnknown;
+  return FaultKind::kNone;
+}
+
 std::string FormatDriveSnapshot(const DriveSnapshot& snapshot) {
   std::ostringstream os;
   os << "\n      ---- drive object dictionary snapshot ----\n"
@@ -459,7 +586,28 @@ std::string FormatDriveSnapshot(const DriveSnapshot& snapshot) {
      << "      0x2AC0 Sub-alarm code    : " << DecodeSubAlarmCode(snapshot.sub_alarm) << '\n'
      << "      0x2030 DC bus             : " << DecodeDcBusVoltage(snapshot.dc_bus_raw) << '\n'
      << "      0x6078 Actual current     : " << snapshot.current_actual << '\n'
-     << "      0x60F4 Following error    : " << snapshot.following_error << " counts\n"
+     << "      0x60F4 Following error    : " << snapshot.following_error << " counts\n";
+  if (snapshot.motion_limits_valid) {
+    os << "      ---- motion limits (a zero here blocks every target position) ----\n"
+       << "      0x607F Max profile speed : " << snapshot.max_profile_speed << '\n'
+       << "      0x6083 Profile accel     : " << snapshot.profile_accel << '\n'
+       << "      0x6084 Profile decel     : " << snapshot.profile_decel << '\n'
+       << "      0x607D:01 Position limit : " << snapshot.position_limit_min << '\n'
+       << "      0x607D:02 Position limit : " << snapshot.position_limit_max << '\n';
+    if (snapshot.max_profile_speed == 0) {
+      os << "      0x607F is ZERO: this drive cannot execute a profile move at any"
+            " setpoint. Raise it in Luna (P2-xx) before trusting any motion test.\n";
+    }
+    if (snapshot.position_limit_min != 0 && snapshot.position_limit_max != 0 &&
+        (snapshot.position_limit_min > snapshot.position_limit_max ||
+         0 < snapshot.position_limit_min ||
+         0 > snapshot.position_limit_max)) {
+      os << "      0x607D window [" << snapshot.position_limit_min << " .. "
+         << snapshot.position_limit_max << "] excludes 0: the encoder's current origin"
+            " sits outside the software position limits.\n";
+    }
+  }
+  os
      << "      main voltage (SW b4)      : "
      << (MainVoltagePresent(snapshot.statusword)
              ? "PRESENT (Statusword bit 4 Voltage_enabled = 1) -> the drive is powered"

@@ -53,7 +53,7 @@ bool ChangeWorkingDirectory(const std::string& dir, std::string* previous);
  *
  * Candidate 5 matches on the file name alone and can therefore pick a *different*
  * configuration that happens to share the name (e.g. config/master.dcf vs
- * config/single_axis_500k/master.dcf). Candidates 1-4 always keep the sub-directory, so
+ * config/<other>/master.dcf). Candidates 1-4 always keep the sub-directory, so
  * they are tried first and this ambiguity can only arise when the given path really is
  * unavailable.
  *

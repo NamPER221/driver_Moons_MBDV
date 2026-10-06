@@ -37,6 +37,12 @@ slave_1:
   node_id: 1
   boot: true
   mandatory: true
+  # CAN-loss detection: lely's boot-slave process writes 0x1017 = 100 ms (concise DCF) on
+  # EVERY boot, so a drive restarted after a heartbeat timeout comes back at the fast period
+  # instead of its stored 1000 ms, which would trip the consumer and get it reset forever.
+  # Master 0x1016 for this node = 100 x 3.0 = 300 ms. Keep in step with config/params.yaml.
+  heartbeat_producer: 100
+  heartbeat_multiplier: 3.0
   # ---- RPDO: master -> drive ----
   rpdo:
     1:                              # COB-ID 0x200 + node
@@ -61,27 +67,29 @@ slave_1:
         - { index: 0x6040, sub_index: 0 } # Controlword (16-bit)
         - { index: 0x60FF, sub_index: 0 } # Target velocity (32-bit)
   # ---- TPDO: drive -> master ----
+  # Event timers must equal rates.tpdo*_event_ms in config/params.yaml: stage S09 compares
+  # against those and re-programs every PDO that differs, on every boot.
   tpdo:
-    1:                              # COB-ID 0x180 + node, 10 ms cyclic Statusword
+    1:                              # COB-ID 0x180 + node, 5 ms Statusword
       enabled: true
       cob_id: auto
       transmission: 255
-      event_timer: 10
+      event_timer: 5
       mapping:
         - { index: 0x6041, sub_index: 0 } # Statusword (16-bit)
-    2:                              # COB-ID 0x280 + node, 10 ms position + velocity
+    2:                              # COB-ID 0x280 + node, 5 ms position + velocity
       enabled: true
       cob_id: auto
       transmission: 255
-      event_timer: 10
+      event_timer: 5
       mapping:
         - { index: 0x6064, sub_index: 0 } # Position actual value (32-bit)
         - { index: 0x606C, sub_index: 0 } # Velocity actual value (32-bit)
-    3:                              # COB-ID 0x380 + node, 100 ms live fault diagnosis
+    3:                              # COB-ID 0x380 + node, 50 ms live fault diagnosis
       enabled: true
       cob_id: auto
       transmission: 255
-      event_timer: 100
+      event_timer: 50
       mapping:
         - { index: 0x603F, sub_index: 0 } # CiA 402 error code (16-bit)
         - { index: 0x200F, sub_index: 0 } # DSP alarm code (32-bit)
@@ -91,6 +99,9 @@ slave_2:
   node_id: 2
   boot: true
   mandatory: true
+  # Same as slave_1: 0x1017 = 100 ms on every boot, master 0x1016 = 300 ms.
+  heartbeat_producer: 100
+  heartbeat_multiplier: 3.0
   rpdo:
     1:
       enabled: true
@@ -113,19 +124,19 @@ slave_2:
       mapping:
         - { index: 0x6040, sub_index: 0 }
         - { index: 0x60FF, sub_index: 0 }
-  tpdo:
+  tpdo:                             # same event timers as slave_1 and params.yaml
     1:
       enabled: true
       cob_id: auto
       transmission: 255
-      event_timer: 10
+      event_timer: 5
       mapping:
         - { index: 0x6041, sub_index: 0 }
     2:
       enabled: true
       cob_id: auto
       transmission: 255
-      event_timer: 10
+      event_timer: 5
       mapping:
         - { index: 0x6064, sub_index: 0 }
         - { index: 0x606C, sub_index: 0 }
@@ -133,7 +144,7 @@ slave_2:
       enabled: true
       cob_id: auto
       transmission: 255
-      event_timer: 100
+      event_timer: 50
       mapping:
         - { index: 0x603F, sub_index: 0 }
         - { index: 0x200F, sub_index: 0 }

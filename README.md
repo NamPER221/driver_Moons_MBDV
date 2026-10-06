@@ -1,258 +1,174 @@
-# Moons' MBDV Dual-Axis CANopen Master (lely-core C++)
+# Moons' MBDV-2X-520AC: CANopen master hai trục (lely-core, C++14)
 
-Điều khiển đồng thời 2 trục servo **Moons' MBDV-2X-520AC** theo chuẩn **CiA 402 / CANopen**
-bằng thư viện **lely-core** (`liblely-coapp`), kèm hệ thống log theo từng **giai đoạn
-(stage)** để xác định chính xác lỗi xảy ra ở bước nào.
+`mbdv_dual_axis_node` điều khiển **cả hai trục** của một drive **Moons' MBDV-2X-520AC** qua
+**CANopen (CiA 301 / CiA 402)**, dùng thư viện **lely-core** (`liblely-coapp` 2.3.x). Hai trục là
+hai bánh của một robot **vi sai (differential drive)**. Chương trình nhận lệnh `(v, ω)` rồi đổi ra
+tốc độ từng bánh. Nó đọc encoder để tính odometry ở 200 Hz, giám sát heartbeat của từng node và
+tự phục hồi khi mất kết nối hoặc khi drive báo lỗi.
+
+Mỗi bước khởi động được ghi log theo **16 giai đoạn (S01…S16)**. Khi có lỗi, chương trình in ra
+giai đoạn hỏng, lý do và việc cần kiểm tra.
+
+> ⚠️ **An toàn.** Chương trình điều khiển động cơ thật. Khi thử nghiệm, hãy kê bánh khỏi mặt đất
+> và để tay gần E-stop cho tới khi xử lý xong các rủi ro ở **mục 12**.
+
+## Mục lục
+
+1. Trạng thái hiện tại
+2. Phần cứng và địa chỉ hoá
+3. Kiến trúc phần mềm
+4. Ánh xạ PDO
+5. CiA 402 và chế độ drive (P1-00)
+6. Biên dịch
+7. Chạy chương trình
+8. Cấu hình runtime (`config/params.yaml`)
+9. Log theo giai đoạn và báo cáo chẩn đoán
+10. Tra cứu lỗi theo giai đoạn
+11. Đã triển khai và mức độ kiểm chứng
+12. Hạn chế và rủi ro đã biết
+13. Các phát hiện trên phần cứng thật
+14. Cấu trúc thư mục
+15. Tài liệu tham khảo
 
 ---
 
-## 0. Nguồn tài liệu đã đọc
+## 1. Trạng thái hiện tại (2026-10-06)
 
-| Tài liệu | Nội dung dùng cho dự án |
+Bàn thử gồm 1 drive MBDV-2X-520AC, nguồn chính 48,2 V, bus `can0` 500 kbps qua adapter
+PEAK PCAN-USB (driver `peak_usb`). Node 1 là **AX1, bánh trái**; node 2 là **AX2, bánh phải**.
+
+| Hạng mục | Kết quả |
 |---|---|
-| `docx/CANOPEN-EDS-MBDV-Servo-DulAxes-V1.0.eds` | Object Dictionary, ánh xạ PDO mặc định của nhà sản xuất, các object chẩn đoán của hãng (`0x200F`, `0x2020`, `0x2021`, `0x2070`, `0x2A30` …) |
-| `docx/MBDV-Hardware-Manual-EN20230926-MOONS.pdf` | §4.2.2 DIP switch, §4.8.3 chân CAN, §5.2 mã cảnh báo, §6 commissioning, §8.2/§8.3 tham số (P1-00, P1-17, P1-18, P3-05 …), §9.1 danh mục alarm |
-| `docx/MBDV-2X-520AC.pdf` | Bản vẽ kích thước 2D (không có thông tin điều khiển) |
+| Bring-up S01→S12, cả hai trục | PASS, servo ON sau khoảng 1,2 s |
+| `--test-kinematics` (4 pha, khoảng 15 s) | PASS; in `All recorded stages passed.` và tự thoát |
+| Quy đổi lệnh | `v = 0,2 m/s` → 4341 counts/s mỗi bánh; `ω = 0,5 rad/s` → AX1 −2466, AX2 +2466 counts/s |
+| Đo thực tế | Đi thẳng: `v` 0,19–0,21 m/s, đi được khoảng 0,58 m sau 3 s. Quay tại chỗ: `ω` 0,46–0,54 rad/s. Đi cung: `v` ≈ 0,15 m/s, `ω` ≈ 0,3 rad/s |
+| Dừng giữa các pha | Hai trục dừng cùng lúc: tới lượt kiểm tra thì AX2 đã về 0 |
+| S15 tắt servo | PASS cả hai trục (Statusword `0233`, Switched On) |
+
+Các vấn đề còn mở nằm ở **mục 12**.
 
 ---
 
-## 1. Kiến trúc hệ thống & Địa chỉ hóa 2 trục
+## 2. Phần cứng và địa chỉ hoá
 
-Theo MBDV Hardware Manual §4.2.2 (bảng **MBDV-2X-520AC**):
+Theo MBDV Hardware Manual §4.2.2 (MBDV-2X-520AC):
 
-* **Trục 1 (Axis 1)**: `SW1..SW3` đặt Node-ID — mặc định `1`
-* **Trục 2 (Axis 2)**: `SW4..SW6` đặt Node-ID — mặc định `2`
-* **Baudrate**: `SW7` — `0` = cài đặt qua Luna (mặc định **1 Mbps**), `1` = **500 kbps**
-* **Trở kết thúc 120 Ω**: `SW8` — `0` = không có, `1` = có (đặt ở thiết bị cuối bus)
+| DIP | Ý nghĩa |
+|---|---|
+| `SW1..SW3` | Node-ID của trục 1; `0` = lấy từ phần mềm Luna |
+| `SW4..SW6` | Node-ID của trục 2; `0` = lấy từ phần mềm Luna |
+| `SW7` | `1` = ép 500 kbps; `0` = tốc độ đặt trong Luna (P1-18). `0` **không** có nghĩa là bus chạy 1 Mbps |
+| `SW8` | `1` = bật trở 120 Ω (chỉ bật ở thiết bị cuối bus) |
 
-Cả hai trục là 2 Node CANopen độc lập trên cùng một bus CAN vật lý, dùng chung file EDS.
+Hai trục là **hai node CANopen độc lập** trên cùng một bus và dùng chung một file EDS.
 
-| DIP | Axis 1 (Node 1) | Axis 2 (Node 2) | Vai trò |
-|---|---|---|---|
-| Node-ID | `SW1=1, SW2=0, SW3=0` | `SW4=0, SW5=1, SW6=0` | Địa chỉ CANopen |
-| Baudrate 500 kbps | `SW7=1` | *(dùng chung)* | Tốc độ bus |
-| Trở 120 Ω | `SW8=1` (nếu ở cuối bus) | — | Đóng bus |
-
-> **Lưu ý**: `SW1..SW3 = 0,0,0` (hoặc `SW4..SW6 = 0,0,0`) nghĩa là **không dùng DIP switch**,
-> Node-ID lấy từ phần mềm Luna và **mặc định là 1**. Đây là nguyên nhân rất hay gặp khiến
-> cả 2 trục cùng trả lời ở Node 1 — chương trình sẽ báo lỗi ở **giai đoạn S08**.
+> Trên bàn thử hiện tại, **mọi DIP đều tắt** (`0x2070 = 0x00000000`): node-ID 1/2 và tốc độ 500 kbps
+> đều được đặt trong Luna. S08 kiểm tra giá trị thật qua `0x2020` (node-ID) và `0x2021` (tốc độ,
+> đơn vị kbps).
 
 ---
 
-## 2. Quy trình 4 bước kỹ thuật
+## 3. Kiến trúc phần mềm
 
-### Bước 1 — Import EDS & cấu hình Master
+```text
+ main thread                   lely event-loop thread                sniffer thread
+ ───────────────────────────   ───────────────────────────────────   ─────────────────────────
+ CLI + config/params.yaml      AsyncMaster: NMT, SDO, heartbeat      socket SocketCAN thứ hai,
+ DualAxisController            MbdvAxisDriver AX1 (FiberDriver)      chỉ nghe; giải mã TPDO
+   vòng 200 Hz: Supervise(),   MbdvAxisDriver AX2 (FiberDriver)      0x18x/0x28x/0x38x theo
+   SetCmdVel(), odometry,        stage S05..S15 chạy trong fiber     COB-ID → statusword,
+   in telemetry                  RPDO tự dựng → CanChannel::write    vị trí, vận tốc từng trục
+```
 
-`dcfgen` được tích hợp trong CMake, đọc `config/master.yaml` + file EDS, sinh ra:
-`config/master.dcf` (OD của Master), `config/single_axis_500k/master.dcf` và các
-`slave_*.bin` (gói SDO cấu hình từng slave).
+Mỗi quyết định thiết kế dưới đây sửa một lỗi đã gặp trên phần cứng:
 
-> **Cảnh báo quan trọng về `dcfgen`** — xác minh bằng `dcfgen -r -v`:
-> 0. **`dcf-tools` 2.3.5 ghi DCF bị ĐẢO COB-ID của RPDO và TPDO.** `0x14xx:01` và
->    `0x18xx:01` bị hoán đổi giá trị trong file `master.dcf` — ngay cả khi YAML không
->    khai báo PDO nào. Lệnh SDO vẫn đúng (được tạo từ object trong RAM) nên drive cấu
->    hình đúng, nhưng **lely đọc text DCF** nên sẽ gửi RPDO đi COB-ID của TPDO và
->    lắng nghe TPDO trên COB-ID của RPDO ⇒ **SDO chạy được, PDO chết cả hai chiều**.
->    CMake chạy `tools/fix_dcf_pdo_cobid.py` ngay sau `dcfgen` để sửa và kiểm chứng.
-> 1. Nếu YAML không khai báo `transmission:`, `dcfgen` **không** ghi `0x140x:02` /
->    `0x180x:02`. Driver MBDV mặc định đặt RPDO2/RPDO3 là **0xFE**, mà 2 bit thấp của
->    transmission type kiểu CiA 301 là `10b` = **"chỉ RTR"**. RPDO ở chế độ này **âm thầm
->    bỏ qua** khung hình được gửi thường lệ → lệnh vị trí / vận tốc **không bao giờ được thực thi**.
->    → Đã sửa: mọi PDO trong YAML đều khai báo `transmission: 255` (`0xFF` = event driven).
-> 2. `dcfgen` phát `0x140x:01` / `0x180x:01` với **bit 31 = 0** ("PDO disabled") ở lần ghi cuối
->    ngay cả khi YAML ghi `enabled: true` → cờ `enabled` bị đảo ngược trong `.bin` sinh ra.
->    → Đã xử lý ở tầng runtime: **giai đoạn S09** tự cấu hình lại và **kiểm chứng đọc ngược**
->      toàn bộ ánh xạ PDO theo đúng thứ tự CiA 301, nên trạng thái cuối cùng trên drive luôn đúng.
+1. **RPDO được dựng tay cho từng node.** OD của master chỉ có một bản `0x6040`/`0x607A`/`0x60FF`,
+   còn lely phát mọi PDO chứa object vừa ghi. Vì vậy, ghi lệnh cho một trục khiến **cả hai node**
+   nhận lệnh của nhau. Trên bus đo được AX1 `+1500` và AX2 `-1500` triệt tiêu về 0, nên robot không
+   quay được. `MbdvAxisDriver::SendRpdo()` tự dựng frame `0x200/0x300/0x400 + node` và gửi qua
+   `CanChannel::write()`. RPDO1 mang cả `0x6060`, nên byte thứ 3 phải là mode đang chọn.
+2. **Phản hồi đọc qua `CanSniffer`.** Cũng vì OD dùng chung, TPDO của hai node ghi đè lên cùng một
+   object. Phản hồi được giải mã thô theo COB-ID trên một socket chỉ nghe; socket chính của lely
+   dành cho SDO, NMT và heartbeat.
+3. **`tools/fix_master_dcf.py`.** File `master.dcf` do `dcfgen` sinh ra trỏ PDO vào object gương
+   nội bộ (`0x2001`…) và thiếu hẳn các object CiA 402. Hậu quả: lely không phát được khung RPDO nào,
+   và lỗi này im lặng vì SDO vẫn chạy. Script chèn các object thật, viết lại ánh xạ, và **từ chối
+   ghi file** nếu còn ánh xạ không resolve hoặc quyền truy cập sai (`AccessType` phải là `rw`).
+   CMake chạy script ngay sau `dcfgen`.
+4. **Giám sát và dừng an toàn.** Khi một node mất heartbeat (producer 100 ms, consumer 300 ms) hoặc
+   servo rời trạng thái Operation Enabled, chương trình bật *stop output* và ra lệnh 0 cho mọi trục
+   còn liên lạc được. Sau đó nó tự kết nối lại hoặc phục hồi lỗi. Chi tiết ở **mục 8** và trong
+   `docx/MBDV-dual-axis-liveness-and-recovery.md`.
 
-### Bước 2 — Quản lý trạng thái NMT
+> **Quy tắc thread:** lệnh tới một trục đi qua strand của driver đó (`Defer`). Đừng thêm thread mới
+> gửi lệnh tới driver. Lý do ở **mục 12**, rủi ro 1.
 
-1. Slave gửi **Boot-up** (`COB-ID 0x700 + NodeID`, data `0x00`) → node ở **Pre-Operational**.
-2. Master nạp cấu hình PDO qua SDO download (`slave_N.bin`).
-3. Master gửi **NMT Start Remote Node** (`CS = 0x01`) → **Operational**.
-4. Khi **Operational**, PDO thời gian thực bắt đầu truyền/nhận.
+---
 
-### Bước 3 — Ánh xạ PDO (đã hiệu chỉnh theo EDS)
+## 4. Ánh xạ PDO
 
-**RPDO (Master → Drive)**
+RPDO (master → drive), transmission `0xFF` (event-driven):
 
-| PDO | COB-ID | Ánh xạ | Ghi chú |
-|---|---|---|---|
-| RPDO1 | `0x200 + Node` | `0x6040` Controlword (16b) + `0x6060` Modes of operation (8b) | Transmission `0xFF` |
-| RPDO2 | `0x300 + Node` | `0x6040` (16b) + `0x607A` Target position (32b) | **Transmission phải là `0xFF`, không phải `0xFE`** |
-| RPDO3 | `0x400 + Node` | `0x6040` (16b) + `0x60FF` Target velocity (32b) | **Transmission phải là `0xFF`, không phải `0xFE`** |
+| PDO | COB-ID | Ánh xạ |
+|---|---|---|
+| RPDO1 | `0x200 + node` | `0x6040` Controlword (16 bit) + `0x6060` Modes of operation (8 bit) |
+| RPDO2 | `0x300 + node` | `0x6040` + `0x607A` Target position (32 bit) |
+| RPDO3 | `0x400 + node` | `0x6040` + `0x60FF` Target velocity (32 bit) |
 
-**TPDO (Drive → Master)**
+TPDO (drive → master), transmission `0xFF` kèm event timer:
 
 | PDO | COB-ID | Ánh xạ | Event timer |
 |---|---|---|---|
-| TPDO1 | `0x180 + Node` | `0x6041` Statusword (16b) | 10 ms |
-| TPDO2 | `0x280 + Node` | `0x6064` Position actual (32b) + `0x606C` Velocity actual (32b) | 10 ms |
-| TPDO3 | `0x380 + Node` | `0x603F` CiA 402 error code (16b) + `0x200F` DSP alarm code (32b) | 100 ms (chẩn đoán lỗi tức thời) |
+| TPDO1 | `0x180 + node` | `0x6041` Statusword | 5 ms |
+| TPDO2 | `0x280 + node` | `0x6064` Position actual + `0x606C` Velocity actual | 5 ms |
+| TPDO3 | `0x380 + node` | `0x603F` Error code + `0x200F` DSP alarm code | 50 ms |
 
-RPDO4 (`0x500+Node`) và TPDO4 (`0x480+Node`) không dùng → **tắt** ở S09 để giảm tải bus.
+- S09 tắt RPDO4/TPDO4 để giảm tải bus.
+- Drive mặc định đặt RPDO2/RPDO3 ở `0xFE` (chỉ RTR), nên phải ghi `0xFF`.
+- **S09 kiểm tra trước, sửa sau.** Nó đọc ngược từng PDO và chỉ nạp lại PDO sai, theo đúng thứ tự
+  CiA 301: tắt (bit 31) → xoá số phần tử ánh xạ → ghi ánh xạ → transmission type → event timer →
+  bật lại.
+- Event timer được khai báo **ở hai nơi** và hai nơi phải khớp nhau:
+  - `config/master.yaml`: nạp vào drive lúc boot qua `slave_N.bin`;
+  - `rates.tpdo*_event_ms` trong `config/params.yaml`: giá trị S09 dùng để so sánh.
 
-### Bước 4 — Chu trình trạng thái CiA 402
+  Nếu lệch nhau, lần boot nào S09 cũng phải nạp lại PDO.
+- Tải bus ở 200 Hz là khoảng 1200 TPDO + 480 RPDO = 1680 frame/s, tức khoảng 41% của 500 kbps. Con
+  số này được in ra lúc khởi động.
 
-| Bước | Controlword | Statusword chờ đợi |
+---
+
+## 5. CiA 402 và chế độ drive (P1-00)
+
+| Bước | Controlword | Trạng thái chờ |
 |---|---|---|
-| Shutdown | `0x0006` | `Ready to Switch ON` (`0x0021`) |
-| Switch ON | `0x0007` | `Switched ON` (`0x0023`) |
-| Enable Operation | `0x000F` | `Operation Enabled` (`0x0027`) |
-| Chạy vị trí (PP) | `0x001F` (bit4 New setpoint + bit5 Immediate) | Chờ bit 10 `Target reached` |
+| Shutdown | `0x0006` | Ready to Switch On |
+| Switch On | `0x0007` | Switched On |
+| Enable Operation | `0x000F` | Operation Enabled (servo ON) |
+| Disable Operation (S15) | `0x0007` | Switched On |
 
-**Điều kiện tiên quyết thường bị bỏ sót:** `0x6060` (Modes of operation) **chỉ có tác dụng
-khi P1-00 khớp**, và P1-00 nằm ở object hãng **`0x2A30`** (không phải `0x6061`):
+`0x6060` (Modes of operation) **chỉ có tác dụng khi P1-00 khớp**. P1-00 nằm ở object hãng `0x2A30`:
 
 | P1-00 (`0x2A30`) | Chế độ drive | `0x6060` tương ứng |
 |---|---|---|
-| `21` *(mặc định nhà máy)* | Position Control | `1` — Profile Position |
-| `15` | Velocity Control (8 tốc độ nội bộ) | `3` — Profile Velocity |
-| `1` | Torque Control | `4` — Profile Torque |
+| `21` (mặc định nhà máy) | Position Control | `1`, Profile Position |
+| `15` | Velocity Control | `3`, Profile Velocity |
+| `1` | Torque Control | `4`, Profile Torque |
 
-Nếu ghi `0x6060 = 3` mà `0x2A30` vẫn là `21`, `0x6061` sẽ **không đổi** → chương trình báo lỗi
-ở **giai đoạn S10** kèm giá trị `0x2A30` cần sửa. Dùng `--p1-00 15` để tự ghi và lưu.
-
----
-
-## 3. Hệ thống log theo giai đoạn (Stage)
-
-Mỗi dòng log có định dạng cố định:
-
-```
-[  1.234s][S12   ][AX1    ][INFO ] CiA402: S12.3 Enable Operation: CW=0x000F -> wait for Operation Enabled
-   thời gian      giai đoạn   trục    mức      nội dung
-```
-
-### 3.1. Danh sách 16 giai đoạn
-
-| Mã | Tên | Ý nghĩa — giai đoạn này chứng minh điều gì |
-|---|---|---|
-| `S01` | `CONFIG` | Đọc được file DCF, tham số hợp lệ |
-| `S02` | `CAN_LINK` | Mở được SocketCAN controller + channel |
-| `S03` | `MASTER_LOAD` | `AsyncMaster` dựng được, tạo được driver 2 trục |
-| `S04` | `EVENT_LOOP` | Thread event loop chạy, `master.Reset()` được đăng |
-| `S05` | `BOOTUP` | Nhận được bản tin Boot-up (`0x700+Node = 0x00`) |
-| `S06` | `PREOP` | SDO upload `0x6041` trả lời → node đã rời Boot-up |
-| `S07` | `NMT_START` | NMT Start → **OPERATIONAL** |
-| `S08` | `IDENTITY` | Vendor/Node-ID/Baudrate/P1-00 khớp mong đợi |
-| `S09` | `PDO_VERIFY` | Ánh xạ + transmission type PDO đúng và **đọc ngược xác nhận** |
-| `S10` | `MODE_OF_OP` | Ghi `0x6060` và `0x6061` xác nhận khớp |
-| `S11` | `FAULT_RESET` | Xóa lỗi đang kẹt (nếu có) |
-| `S12` | `SERVO_ON` | Chuỗi Shutdown → SwitchOn → EnableOp thành công |
-| `S13` | `MOTION_CMD` | Ghi được Target position / Target velocity |
-| `S14` | `MOTION_TRACK` | `Target reached` bật, hoặc phản hồi bám theo lệnh |
-| `S15` | `SERVO_OFF` | Tắt servo an toàn |
-| `S16` | `SHUTDOWN` | Giải phóng tài nguyên CAN |
-
-### 3.2. Báo cáo chẩn đoán khi lỗi
-
-Khi chương trình dừng, nó in ra **đúng giai đoạn hỏng** cùng nguyên nhân và cách khắc phục:
-
-```
-==============================================================================
-  DIAGNOSIS - FIRST FAILING STAGE
-==============================================================================
-  Stage      : S08  IDENTITY
-  Purpose    : verify identity + bus params vs expectation
-  Axis       : AX2
-  Elapsed    : 41 ms
-  Reason     : node-ID mismatch: the master addresses node 2 but the drive reports 0x2020 = 1 (1)
-  Hint       : MBDV-2X-520AC DIP switches: axis 1 node-ID = SW1..SW3, axis 2 node-ID = SW4..SW6.
-              A reported value of 1 while you expected 2 means both axes are configured with all
-              switches OFF, which selects the Luna software address (default 1).
-  Last OK    : S07 NMT_START
-  Conclusion : everything up to and including S07 worked; the fault is isolated to S08 IDENTITY.
-==============================================================================
-
-==============================================================================
-  MBDV DUAL-AXIS BRING-UP : FAILURE
-==============================================================================
-  Stage  Name            Axis   Result  Elapsed   Reason
-  ----------------------------------------------------------------------------
-  S01    CONFIG          -      PASS    0ms       DCF 'config/master.dcf' is readable
-  S02    CAN_LINK        -      PASS    1ms       SocketCAN 'can0' open
-  ...
-  S08    IDENTITY        AX1    PASS    38ms      vendor 0x000002D9, node-ID 1, 500 kbps, P1-00=21
-  S08    IDENTITY        AX2    FAIL    41ms      node-ID mismatch: the master addresses node 2 but...
-  ----------------------------------------------------------------------------
-  >>> FIRST FAILING STAGE : S08  IDENTITY   (axis AX2)
-  >>> REASON              : node-ID mismatch: ...
-  >>> HINT                : MBDV-2X-520AC DIP switches: ...
-  >>> LAST GOOD STAGE     : S07 NMT_START
-  >>> VERDICT             : bring-up is blocked at S08 IDENTITY
-==============================================================================
-```
-
-Mã thoát: `0` = mọi giai đoạn PASS, `1` = có giai đoạn FAIL.
-
-### 3.3. Giải mã chẩn đoán lấy từ EDS
-
-Khi có lỗi, chương trình in ra "drive object dictionary snapshot":
-
-| Object | Nội dung | Nguồn |
-|---|---|---|
-| `0x6041` | Statusword + giải mã toàn bộ bit + tên trạng thái CiA 402 | CiA 402 |
-| `0x603F` | Error code, giải mã theo bảng chuẩn CiA 402 | CiA 402 |
-| `0x1001` | Error register, giải mã từng bit | CiA 301 |
-| `0x200F` | **Mã alarm chính thức** — byte thấp **chính là số 2 chữ LED hiển thị** (đã xác minh: `0x200F = …20` ⇔ LED `"20"`) | EDS + Manual §6.2 + đo thực tế |
-| `0x2020` / `0x2021` | Node-ID thực tế / tốc độ bus thực tế (theo **kbps**) | EDS + đo thực tế |
-| `0x2070` | Bitmap DIP switch thật (SW1..SW8) | EDS + Manual §4.2.2 |
-| `0x200B` | DSP status code | EDS |
-| `0x2AC0` | Mã phụ (sub-alarm). **Đính chính: tôi từng nói nó chỉ là bitmask không liên quan alarm — sai.** Nó đổi theo alarm: `0x04000000` khi khoẻ → `0x02010000` khi lỗi | EDS + đo thực tế |
-| `0x2030` | Điện áp bus DC — hiển thị **cả hai cách hiểu** vì EDS không ghi đơn vị; đối chiếu với dải `24–60 VDC` của Manual §4.3 | EDS + đo thực tế |
-| `0x6041` bit 4 | `Voltage_enabled` — tín hiệu **chuẩn CiA 402** cho biết nguồn chính có hay không. Đây mới là nguồn quyết định, không phải `0x2030` | CiA 402 |
-| `0x6078` | Dòng thực tế | CiA 402 |
-| `0x60F4` | Sai số vị trí (following error) | CiA 402 |
-
-`0x603F` và `0x1001` là hai trường **chuẩn, có định nghĩa chính thức** nên được giải mã
-đầy đủ. Riêng `0x200F` trả về mã nội bộ của DSP và **EDS không công bố bảng ánh xạ
-mã ↔ tên**; mã này hiển thị trên LED 2 chữ số của drive với tiền tố `r` (Manual §6.2 có
-nhắc `r09` cho lỗi cáp encoder). Vì vậy chương trình in ra **mã dạng `rNN`** để đối chiếu
-với LED và với danh mục alarm ở Manual §9.1 — không tự suy đoán ánh xạ không có căn cứ.
+- **S08 tự căn chỉnh P1-00.** Nếu giá trị đọc được khác chế độ cần dùng, chương trình ghi giá trị
+  đúng vào `0x2A30` rồi đọc lại. Chế độ cần dùng là `15` cho teleop, `--test-velocity` và
+  `--test-kinematics`, và `21` cho `--test-motion`.
+- **Giá trị này không được lưu** (`0x1010:01`). Mỗi lần bật nguồn, drive quay về giá trị đã lưu; bàn
+  thử hiện lưu `21`. Muốn giữ cố định thì đặt P1-00 trong Luna.
+- `--p1-00 <n>` ép một giá trị cụ thể. `--control-mode 0` bỏ qua bước kiểm tra.
 
 ---
 
-## 4. Cấu trúc mã nguồn
+## 6. Biên dịch
 
-```text
-driver_Moons_MBDV/
-├── CMakeLists.txt
-├── tools/
-│   └── fix_dcf_pdo_cobid.py             # Vá lỗi đảo COB-ID RPDO↔TPDO của dcf-tools
-├── config/
-│   ├── CANOPEN-EDS-MBDV-Servo-DulAxes-V1.0.eds
-│   ├── master.yaml                     # Cấu hình PDO 2 trục (có transmission type)
-│   ├── master.dcf                      # sinh bởi dcfgen
-│   ├── slave_1.bin / slave_2.bin       # sinh bởi dcfgen
-│   └── single_axis_500k/               # Cùng cấu hình nhưng chỉ 1 trục
-├── docx/                               # Tài liệu gốc
-├── include/mbdv/
-│   ├── cia402_defs.hpp                 # Enum + giải mã trạng thái CiA 402
-│   ├── config_path.hpp                 # Phân giải đường dẫn DCF (chạy được mọi nơi)
-│   ├── diagnostics.hpp                 # Stage, Logger, DiagnosticReport
-│   ├── drive_errors.hpp                # Chỉ số OD + giải mã lỗi theo EDS
-│   ├── diff_drive_kinematics.hpp       # Động học vi sai phân
-│   ├── mbdv_axis_driver.hpp            # Driver 1 trục + các giai đoạn S05..S15
-│   ├── dual_axis_controller.hpp        # Điều phối 2 trục
-│   └── single_axis_controller.hpp      # Điều khiển 1 trục
-├── src/
-│   ├── config_path.cpp
-│   ├── diagnostics.cpp
-│   ├── drive_errors.cpp
-│   ├── mbdv_axis_driver.cpp
-│   ├── dual_axis_controller.cpp
-│   ├── single_axis_controller.cpp
-│   ├── diff_drive_kinematics.cpp
-│   ├── main.cpp
-│   └── main_single_axis.cpp
-└── build/
-```
-
----
-
-## 5. Biên dịch & chạy
-
-### 5.1. Biên dịch
+Yêu cầu: CMake ≥ 3.16, trình biên dịch C++14, `lely-core` (các gói `liblely-*` qua `pkg-config`,
+cùng công cụ `dcfgen`), `yaml-cpp`, Python 3.
 
 ```bash
 cd /home/namnc/driver_motor/driver_Moons_MBDV
@@ -261,160 +177,345 @@ cmake ..
 make -j$(nproc)
 ```
 
-### 5.2. Thiết lập SocketCAN
+Khi `config/master.yaml`, file EDS hoặc `tools/fix_master_dcf.py` thay đổi, bước build tự chạy lại
+`dcfgen` và `fix_master_dcf.py`. Nó **sinh lại** `config/master.dcf`, `config/slave_1.bin` và
+`config/slave_2.bin`; các file này có trong git nên sẽ hiện trong `git status`.
+
+---
+
+## 7. Chạy chương trình
+
+### 7.1. Thiết lập SocketCAN
 
 ```bash
 sudo ip link set can0 down
-sudo ip link set can0 type can bitrate 500000      # khớp DIP SW7 = 1
+sudo ip link set can0 type can bitrate 500000
 sudo ip link set can0 up
 ```
 
-Nếu `CanController` báo *Operation not permitted*, không cần sửa `tx_queue_len` — chương trình
-đã tự đọc `tx_queue_len` hiện có của kernel và thử lại với giá trị `1`.
+Chương trình chạy được từ bất kỳ thư mục nào. File `config/master.dcf` được tìm lần lượt ở:
+1. đúng đường dẫn đã gõ;
+2. thư mục gốc dự án, ghi sẵn lúc build;
+3. thư mục cha của executable;
+4. thư mục chứa executable.
 
-**Chạy được từ mọi thư mục.** Đường dẫn DCF mặc định (`config/master.dcf`) được phân giải
-theo thứ tự: đúng như gõ → so với thư mục gốc dự án (được `CMake` nạp sẵn vào binary) →
-so với thư mục cha của executable (layout `build/`) → cạnh executable. Nên chạy được cả:
+S01 `chdir()` vào thư mục chứa DCF để lely tìm thấy `slave_N.bin`, và khôi phục thư mục cũ khi tắt.
 
-```bash
-cd /home/namnc/driver_motor/driver_Moons_MBDV && sudo ./build/mbdv_dual_axis_node --selftest
-cd /home/namnc/driver_motor/driver_Moons_MBDV/build && sudo ./mbdv_dual_axis_node --selftest
-```
+### 7.2. Các chế độ
 
-Nếu DCF thật sự không tồn tại, S01 liệt kê **toàn bộ đường dẫn đã thử** kèm lệnh `dcfgen` cần
-chạy để sinh lại.
+| Chế độ | Làm gì | Lưu ý an toàn |
+|---|---|---|
+| *(không tham số)*, `-t`, `--teleop` | Lái bằng bàn phím qua động học vi sai | robot chạy theo phím |
+| `--selftest` | Chỉ chạy S01→S11 (không bật servo, không kiểm tra P1-00) rồi thoát | an toàn nhất, nên chạy đầu tiên |
+| `--watch` | Chạy S01→S11, rồi đọc `0x200F`/`0x1001` mỗi 250 ms và log mọi thay đổi alarm cho tới khi Ctrl+C | không bật servo |
+| `--monitor` | Bring-up tới servo ON (vận tốc 0), rồi in telemetry cho tới khi Ctrl+C | không ra lệnh chuyển động |
+| `--test-kinematics` | Chạy 4 pha: đi thẳng 0,2 m/s 3 s → quay trái 0,5 rad/s 3 s → đi cung 0,15 m/s + 0,3 rad/s 3 s → dừng 1 s. Tự thoát sau khoảng 15 s | robot đi khoảng 0,6 m rồi quay |
+| `--test-velocity [--velocity N]` | AX1 = `+N`, AX2 = `−N` counts/s (mặc định 5000), **giữ cho tới khi Ctrl+C** | ⚠️ robot **quay tại chỗ liên tục** (khoảng 1 rad/s với N = 5000) |
+| `--test-motion [--step N]` | Profile Position: AX1 `+N`, AX2 `−N` counts, dừng 1,5 s, rồi về 0 | tháo liên kết cơ khí trước khi chạy |
 
-> DCF lưu đường dẫn tới `slave_N.bin` **tương đối so với thư mục của chính DCF**, và lely tự
-> resolve theo thư mục đó — nên chỉ cần tìm đúng file DCF là đủ.
-
-### 5.3. Quy trình chạy khuyến nghị
-
-**Bước 1 — Chẩn đoán bus (chưa cấp động cơ), đây là bước an toàn nhất:**
-
-```bash
-sudo ./build/mbdv_dual_axis_node --selftest --diag
-```
-
-Chạy S01→S11 rồi thoát. Nếu `SUCCESS` thì bus, định danh, PDO đều tốt.
-Dùng `--log-file mbdv.log --log-level debug` để lưu lại toàn bộ dấu vết.
-
-**Bước 2 — Kiểm tra vị trí (PP mode), tháo liên kết cơ khí trước:**
+Trình tự khuyến nghị:
 
 ```bash
-sudo ./build/mbdv_dual_axis_node --test-motion --step 10000 --p1-00 21
+cd /home/namnc/driver_motor/driver_Moons_MBDV
+sudo ./build/mbdv_dual_axis_node --selftest --diag                          # 1. kiểm tra bus
+sudo ./build/mbdv_dual_axis_node --test-kinematics 2>&1 | tee /tmp/kin.log  # 2. kê bánh khỏi mặt đất
+sudo ./build/mbdv_dual_axis_node                                            # 3. teleop
 ```
 
-**Bước 3 — Kiểm tra vận tốc (PV mode):**
+Chạy thành công khi report cuối là `MBDV DUAL-AXIS BRING-UP : SUCCESS` và có dòng `All recorded
+stages passed.` Mã thoát là `0`; nếu có giai đoạn FAIL thì mã thoát là `1`.
+
+### 7.3. Phím teleop
+
+| Phím | Tác dụng |
+|---|---|
+| `W` / `↑` | tăng `v` một bước (tiến) |
+| `S` / `↓` | giảm `v` một bước (lùi) |
+| `A` / `←` | tăng `ω` một bước (quay trái) |
+| `D` / `→` | giảm `ω` một bước (quay phải) |
+| `Space` / `X` | phanh: `v = 0`, `ω = 0` |
+| `+` `=` / `-` `_` | đổi bước `v` thêm ±0,02 m/s (trong khoảng 0,01…0,50; mặc định 0,05) |
+| `]` `>` / `[` `<` | đổi bước `ω` thêm ±0,05 rad/s (trong khoảng 0,05…0,60; mặc định 0,15) |
+| `R` | đặt lại pose odometry về (0, 0, 0) |
+| `Q` / `Esc` | thoát: dừng cả hai trục rồi tắt servo |
+
+Setpoint teleop bị giới hạn ở |v| ≤ 1,0 m/s và |ω| ≤ 2,5 rad/s.
+
+### 7.4. Kiểm chứng PDO trên bus
+
+`tools/verify_run.sh` chạy chương trình kèm `candump`, rồi kết luận từng tầng: master có phát RPDO
+không, drive có trả TPDO không, Statusword dừng ở trạng thái nào, và vị trí có thay đổi không.
 
 ```bash
-sudo ./build/mbdv_dual_axis_node --test-velocity --velocity 5000
+sudo ./tools/verify_run.sh                    # Profile Position, cả hai trục
+sudo ./tools/verify_run.sh --test-velocity
 ```
 
-**Chạy song song 2 trục cùng chiều / động học vi sai phân / giám sát liên tục:**
-
-```bash
-sudo ./build/mbdv_dual_axis_node --test-motion-parallel
-sudo ./build/mbdv_dual_axis_node --test-kinematics
-sudo ./build/mbdv_dual_axis_node --monitor
-```
-
-**Phiên bản 1 trục (Node 1, 500 kbps):**
-
-```bash
-sudo ./build/mbdv_single_axis_node --selftest --diag \
-     -d config/single_axis_500k/master.dcf -1 1
-sudo ./build/mbdv_single_axis_node --test-motion -1 1
-```
-
-### 5.4. Bảng tuỳ chọn CLI
+### 7.5. Tuỳ chọn dòng lệnh
 
 | Tuỳ chọn | Ý nghĩa |
 |---|---|
 | `-i, --interface <dev>` | Giao diện CAN (mặc định `can0`) |
+| `--params <path>` | File tham số runtime (mặc định `config/params.yaml`) |
+| `--dump-params` | In tham số đang dùng rồi thoát |
 | `-d, --dcf <path>` | File `master.dcf` |
-| `-b, --bin <path>` | File `.bin` tải xuống slave (tùy chọn) |
-| `-1, --axis1 <id>` / `-2, --axis2 <id>` | Node-ID từng trục |
-| `--baud <kbps>` | Tốc độ bus **mong đợi** để đối chiếu với `0x2021` ở S08 (`1000\|800\|500\|250\|125\|50\|20\|12`) |
-| `--control-mode <n>` | Giá trị P1-00 **mong đợi** trong `0x2A30` (`1\|15\|21`) |
-| `--p1-00 <n>` | **Ghi thật** giá trị này vào `0x2A30` + lưu `0x1010:01 = 1` trước S10 (dùng `--p1-00 21` khi AX2 đang để `15`) |
-| `--no-pdo-program` | Chỉ kiểm chứng PDO, không ghi (chế độ chẩn đoán) |
-| `--watchdog <ms\|off>` | Watchdog giao tiếp `0x2060` (Manual P1-39). `off` để tắt. **Đo thực tế trên drive này: watchdog đã tắt sẵn (`enable=0`, `timeout=0 ms`) nên KHÔNG phải nguồn gốc** của EMERGENCY `COMMUNICATION(b4)`; tuỳ chọn này chỉ để tiện khi đổi firmware |
-| `--sdo-setpoints` | Gửi target position/velocity qua **SDO** thay vì RPDO. **Bắt buộc** với drive bỏ qua RPDO (mục 16). Đo được: AX2 chạy tới **-4443 / -5000 counts** |
-| `--no-sdo-fallback` | Không thử lại Controlword qua SDO khi RPDO không hiệu quả. Dùng để kiểm tra riêng đường RPDO |
-| `--step <counts>` | Biên độ kiểm tra vị trí (mặc định 10000) |
-| `--velocity <counts/s>` | Setpoint kiểm tra vận tốc (mặc định 5000) |
-| `--boot-timeout <ms>` | Timeout Boot-up / SDO mỗi node (mặc định 3000) |
-| `--servo-timeout <ms>` | Timeout mỗi bước chuyển trạng thái CiA 402 (mặc định 2000) |
-| `--log-level <lvl>` | `trace\|debug\|info\|warn\|error\|fatal` |
+| `-b, --bin <path>` | Concise DCF nạp xuống slave (tuỳ chọn) |
+| `-1, --axis1 <id>` / `-2, --axis2 <id>` | Node-ID từng trục (mặc định 1 / 2) |
+| `--baud <kbps>` | Tốc độ bus **mong đợi**, S08 so với `0x2021` (`1000\|800\|500\|250\|125\|50\|20\|12`) |
+| `--control-mode <n>` | P1-00 mong đợi (`1\|15\|21`); `0` bỏ qua kiểm tra |
+| `--p1-00 <n>` | Ép ghi giá trị này vào `0x2A30` ở S08 (không lưu) |
+| `--no-pdo-program` | Chỉ kiểm tra PDO, không ghi (chế độ chẩn đoán) |
+| `--watchdog <ms\|off>` | Watchdog giao tiếp `0x2060` (P1-39). Xem **mục 12**, rủi ro 2 |
+| `--step <counts>` | Biên độ của `--test-motion` (mặc định 10000) |
+| `--velocity <counts/s>` | Setpoint của `--test-velocity` (mặc định 5000) |
+| `--boot-timeout <ms>` | Timeout boot-up / SDO cho mỗi node (mặc định 3000) |
+| `--servo-timeout <ms>` | Timeout cho mỗi bước chuyển trạng thái CiA 402 (mặc định 2000) |
+| `--log-level <lvl>` | `trace\|debug\|info\|warn\|error\|fatal` (mặc định `info`) |
 | `--log-file <path>` | Ghi thêm log ra file |
-| `--no-color` | Tắt mã màu ANSI |
-| `--diag` | In toàn bộ object chẩn đoán của cả 2 trục trước khi thoát |
+| `--no-color` | Tắt màu ANSI |
+| `--diag` | In mọi object chẩn đoán của cả hai trục trước khi thoát |
 
 ---
 
-## 6. Bảng tra cứu nhanh: lỗi ở giai đoạn nào → kiểm tra gì
+## 8. Cấu hình runtime (`config/params.yaml`)
+
+Mọi tham số runtime nằm trong `config/params.yaml`. Thiếu file thì chương trình dùng giá trị mặc
+định kèm cảnh báo; file sai định dạng thì chương trình **từ chối chạy**. Dùng `--dump-params` để xem
+giá trị đang có hiệu lực.
+
+> `config/master.yaml` là **một file khác**: đó là đầu vào của `dcfgen` lúc build.
+
+| Nhóm | Khoá chính (giá trị hiện tại) | Ý nghĩa |
+|---|---|---|
+| `bus` | `interface: can0`, `expect_bitrate_bps: 500000` | S08 so với `0x2021` |
+| `nodes` | `axis1_id: 1`, `axis2_id: 2` | |
+| `rates` | `control_hz: 200`, `controlword_hz: 20`, `tpdo1/2/3_event_ms: 5/5/50` | vòng điều khiển và odometry chạy 200 Hz; controlword gửi lại 20 Hz |
+| `heartbeat` | `producer_ms: 100`, `consumer_ms: 300` | phát hiện mất node trong vòng 300 ms |
+| `liveness` | `stop_hold_ms: 500` | thời gian tối thiểu giữ stop output |
+| `reconnect` | `enabled`, `recover_can_link`, `backoff_ms: 500…5000`, `max_attempts: 0` (thử mãi) | tự kết nối lại node / CAN link |
+| `fault_recovery` | `auto_reset: true`, `retry_backoff_ms: 1000`, `max_attempts: 5` | fault reset rồi bật lại servo khi nguyên nhân đã hết |
+| `drive` | `expect_p1_00: 15`, `write_p1_00: 0`, `profile_accel/decel: 25000/50000`, `watchdog_ms: -1`, `watchdog_action: -1`, `program_pdos: true` | xem mục 5 và mục 12 |
+| `kinematics` | `wheel_radius_m: 0.07333`, `wheel_base_m: 0.4544`, `gear_ratio: 1.0`, `encoder_cpr: 10000` | sai hình học bánh xe thì sai toàn bộ odometry |
+| `odometry` | `enabled`, `callback: true`, `udp: false` (`239.255.0.10:5565`) | xuất pose/twist cho lớp phía trên (ROS 2) |
+| `misc` | `dcf`, `bin`, `boot_timeout_ms: 3000`, `servo_timeout_ms: 2000` | |
+
+**Stop output.** Khi bất kỳ trục nào bị mất hoặc lỗi, `DualAxisController::StopRequested()` bật lên
+và callback `SetStopCallback()` được gọi. Nên nối tín hiệu này vào đầu vào E-STOP của drive
+(1_X4 chân 4, 2_X4 chân 12, P5-03 = 14 "Open = E-stop", theo comment trong `params.yaml`): khi đã mất
+CAN, chỉ phần cứng mới dừng được drive.
+
+**STO không gỡ được bằng phần mềm** (Manual §4.11). Chương trình phát hiện và báo rõ tình trạng
+này, rồi tự phục hồi ngay khi người vận hành đóng lại mạch an toàn.
+
+---
+
+## 9. Log theo giai đoạn và báo cáo chẩn đoán
+
+Định dạng mỗi dòng log:
+
+```text
+[   1.166s][S12][AX1   ][INFO ] S12.3 Enable Operation reached -> 1637 [Operation Enabled (Servo ON)] ...
+ thời gian  stage trục   mức    nội dung
+```
+
+| Mã | Tên | Giai đoạn này chứng minh điều gì |
+|---|---|---|
+| `S01` | `CONFIG` | Đọc được tham số và tìm được file DCF |
+| `S02` | `CAN_LINK` | Mở được SocketCAN controller và channel |
+| `S03` | `MASTER_LOAD` | Dựng được `AsyncMaster` và driver cho hai trục |
+| `S04` | `EVENT_LOOP` | Thread event loop đã chạy, `master.Reset()` đã được gửi |
+| `S05` | `BOOTUP` | Nhận được Boot-up (`0x700 + node = 0x00`), lely đã nạp xong concise DCF |
+| `S06` | `PREOP` | SDO upload `0x6041` có trả lời |
+| `S07` | `NMT_START` | NMT Start → **OPERATIONAL** |
+| `S08` | `IDENTITY` | Vendor, node-ID, tốc độ bus, P1-00 khớp; ramp `0x6083`/`0x6084`; heartbeat |
+| `S09` | `PDO_VERIFY` | PDO đúng ánh xạ, transmission type, event timer, đã **đọc ngược xác nhận** |
+| `S10` | `MODE_OF_OP` | Đã ghi `0x6060` và `0x6061` xác nhận khớp |
+| `S11` | `FAULT_RESET` | Xoá được lỗi đang kẹt (nếu có) |
+| `S12` | `SERVO_ON` | Chạy xong chuỗi Shutdown → Switch On → Enable Operation |
+| `S13` | `MOTION_CMD` | Ghi được target position / target velocity |
+| `S14` | `MOTION_TRACK` | `Target reached` bật, hoặc vận tốc bám theo lệnh |
+| `S15` | `SERVO_OFF` | Giảm tốc có kiểm soát rồi Disable Operation |
+| `S16` | `SHUTDOWN` | Dừng event loop và giải phóng tài nguyên CAN |
+
+Cuối mỗi lần chạy, chương trình in bảng kết quả theo từng giai đoạn và từng trục. Khi có lỗi, nó in
+thêm khối giai đoạn hỏng đầu tiên:
+
+```text
+==============================================================================
+  DIAGNOSIS - FIRST FAILING STAGE
+==============================================================================
+  Stage      : S08  IDENTITY
+  Purpose    : verify identity + bus params vs expectation
+  Axis       : AX2
+  Reason     : node-ID mismatch: the master addresses node 2 but the drive reports 0x2020 = 1 (1)
+  Hint       : MBDV-2X-520AC DIP switches: axis 1 node-ID = SW1..SW3, axis 2 node-ID = SW4..SW6 ...
+  Last OK    : S07 NMT_START
+  Conclusion : bring-up for AX2 worked up to and including S07; the fault is isolated to S08 IDENTITY.
+==============================================================================
+```
+
+Các object chẩn đoán được đọc và giải mã (in đầy đủ khi chạy với `--diag`):
+
+| Object | Nội dung |
+|---|---|
+| `0x6041` | Statusword, giải mã từng bit và tên trạng thái CiA 402. Bit 4 `Voltage_enabled` cho biết có nguồn chính hay không |
+| `0x603F` / `0x1001` | Error code CiA 402 / error register CiA 301, giải mã đầy đủ theo chuẩn |
+| `0x200F` | Mã alarm của DSP. Byte thấp **chính là số hiện trên LED** (`rNN`). EDS không công bố bảng tên lỗi, nên chương trình chỉ in mã để đối chiếu với Manual §9.1 |
+| `0x2020` / `0x2021` | Node-ID thực / tốc độ bus thực (kbps) |
+| `0x2070` | Bitmap DIP switch (SW1..SW8) |
+| `0x2030` | Điện áp bus DC, đơn vị 0,1 V |
+| `0x2AC0` | Mã phụ; **không** dùng làm chỉ báo lỗi (khi drive khoẻ vẫn trả `0x04000000`) |
+| `0x6078` / `0x60F4` | Dòng thực tế / sai số vị trí |
+
+---
+
+## 10. Tra cứu lỗi theo giai đoạn
 
 | Giai đoạn FAIL | Triệu chứng điển hình | Kiểm tra |
 |---|---|---|
-| `S01 CONFIG` | `cannot find DCF file` (kèm danh sách đường dẫn đã thử) | Chạy lại `dcfgen`, hoặc truyền `-d /đường/dẫn/tuyệt/đối` |
-| `S02 CAN_LINK` | `No such device` / `Operation not permitted` | `ip link show can0`; `ip link set can0 up`; đúng `bitrate`; chạy bằng root |
-| `S03 MASTER_LOAD` | `AsyncMaster construction failed` | DCF lỗi cú pháp; đường dẫn EDS trong `master.yaml` |
-| `S05 BOOTUP` | `SDO abort code 08000020` / `slave_1.bin: No such file` | **Gần như luôn là lỗi đường dẫn `.bin`** — xem dòng S01 "working directory changed to". Nếu không có Boot-up: nguồn 24 VDC AUX, dây `CAN_H`/`CAN_L`/GND, LED có hiện mã alarm thay vì số node |
-| `S06 PREOP` | SDO upload timeout | Tốc độ bus; trở 120 Ω (`SW8=1` ở thiết bị cuối); không có master thứ hai trên bus |
+| `S01 CONFIG` | `cannot find DCF file` (kèm danh sách đường dẫn đã thử) | Build lại để sinh DCF, hoặc truyền `-d /đường/dẫn/tuyệt/đối` |
+| `S02 CAN_LINK` | `No such device` / `Operation not permitted` | `ip link show can0`; bus đã `up` đúng `bitrate` chưa; chạy bằng root |
+| `S03 MASTER_LOAD` | `AsyncMaster construction failed` | DCF sai cú pháp; đường dẫn EDS trong `master.yaml` |
+| `S05 BOOTUP` | SDO abort `08000020` / `slave_1.bin: No such file` | **Gần như luôn là lỗi đường dẫn `.bin`**: xem dòng S01 "working directory changed to". Nếu không thấy Boot-up: nguồn 24 VDC AUX, dây `CAN_H`/`CAN_L`/GND, LED hiện mã alarm thay vì số node |
+| `S06 PREOP` | SDO upload timeout | Tốc độ bus; trở 120 Ω ở thiết bị cuối; trên bus không có master thứ hai |
 | `S07 NMT_START` | Không sang OPERATIONAL | Node đã tới PRE-OP chưa; có master khác gửi NMT không |
-| `S08 IDENTITY` | `vendor ID` / `node-ID mismatch` / `bit-rate mismatch` / `drive control mode mismatch` | `SW1..SW3`, `SW4..SW6`; `SW7`; đối chiếu `0x2020`, `0x2021`, `0x2070`. Với `control mode mismatch` dùng `--p1-00 21` (hoặc `--p1-00 15` cho PV). `--selftest` **bỏ qua** kiểm tra này vì nó kiểm tra bus chứ không kiểm tra chế độ chạy. Cảnh báo nguồn chỉ xuất hiện khi **bit 4 của Statusword = 0**, tức drive thật sự không thấy điện áp chính ở `V+/V−` (`24–60 VDC`, Manual §4.3) |
-| `S09 PDO_VERIFY` | Liệt kê từng sai lệch `0x14xx/0x16xx/0x18xx/0x1Axx` | Ánh xạ PDO; **transmission type không được là `0xFE`**; event timer TPDO1. `0x06010002` = ghi sai **sub-index** (COB-ID là `:01`, không phải `:00`). `0x06090030` = đang cố ghi giá trị `0` vào COB-ID, điều mà drive này từ chối |
-| `S10 MODE_OF_OP` | `0x6061` không đổi sau khi ghi `0x6060` | Ghi P1-00 khớp vào `0x2A30` (PP=21, PV=15, TQ=1) — dùng `--p1-00` |
-| `S11 FAULT_RESET` | Không xóa được lỗi | Đọc LED + `0x603F` + `0x200F`; lỗi không reset được (điện áp nội bộ, lỗi encoder) cần kiểm tra dây và power-cycle |
-| `S12 SERVO_ON` | Kẹt ở `Switch On Disabled` hoặc `Fault` | Log in ra `controlword path = ...` và `digital inputs`:<br>• `SDO fallback (RPDO did not work)` ⇒ lỗi đường truyền PDO / cấu hình `0x14xx`–`0x1Axx`, **không phải lỗi drive**<br>• `none` ⇒ drive nhận lệnh nhưng từ chối chuyển trạng thái → kiểm tra STO (§4.11), input `0x60FD`/`0x2A20`, `P1-02`<br>• Cả hai đều `Pass` nhưng Statusword không đổi ⇒ kiểm tra main power `24–60 VDC` ở `V+/V−`, encoder, `0x603F`/`0x200F` |
-| `S13 MOTION_CMD` | Lệnh không được nhận | Đúng chế độ S10; RPDO2/RPDO3 có `0x6040` + `0x607A`/`0x60FF` và transmission event-driven |
-| `S14 MOTION_TRACK` | Không có `Target reached` / vận tốc không bám | Đã thử tải không tải chưa; chạm giới hạn cơ khí; `P3-04` quá nhỏ; `P1-06` quá thấp; encoder không có phản hồi |
-| `S15 SERVO_OFF` | Không tắt được servo | Lỗi đang kẹt, hoặc node đã rời OPERATIONAL |
+| `S08 IDENTITY` | `vendor ID` / `node-ID mismatch` / `bit-rate mismatch` / `could not write ... 0x2A30` | `SW1..SW6`, `SW7`; đối chiếu `0x2020`, `0x2021`, `0x2070`. Nếu ghi P1-00 thất bại: khoá tham số `0x2A35`. Cảnh báo về nguồn chỉ xuất hiện khi bit 4 Statusword = 0 (thiếu điện áp chính `24–60 VDC` ở `V+/V−`) |
+| `S09 PDO_VERIFY` | Liệt kê từng sai lệch `0x14xx/0x16xx/0x18xx/0x1Axx` | Transmission type không được là `0xFE`. Abort `0x06010002` = ghi sai sub-index (COB-ID là `:01`). Abort `0x06090030` = ghi `0` vào COB-ID, drive này từ chối |
+| `S10 MODE_OF_OP` | `0x6061` không đổi sau khi ghi `0x6060` | P1-00 trong `0x2A30` phải khớp (PP = 21, PV = 15, TQ = 1) |
+| `S11 FAULT_RESET` | Không xoá được lỗi | Đọc LED, `0x603F`, `0x200F`. Lỗi không reset được (điện áp nội bộ, encoder) cần kiểm tra dây và tắt/bật nguồn |
+| `S12 SERVO_ON` | Kẹt ở `Switch On Disabled` hoặc `Fault` | Xem kết quả đọc ngược `0x6040` trong log. **Không đổi** ⇒ khung RPDO không tới drive: kiểm tra ánh xạ `0x1400`/`0x1600` và dây CAN. **Đúng giá trị đã gửi** ⇒ drive nhận lệnh nhưng từ chối chuyển trạng thái: kiểm tra STO (§4.11), input `0x60FD`/`0x2A20`, `P1-02` |
+| `S13 MOTION_CMD` | Lệnh không được nhận | Đúng chế độ ở S10; RPDO2/RPDO3 có `0x6040` + `0x607A`/`0x60FF`, transmission event-driven |
+| `S14 MOTION_TRACK` | Không có `Target reached` / vận tốc không bám | Đã chạy thử không tải chưa; chạm giới hạn cơ khí; `P3-04` quá nhỏ; `P1-06` quá thấp; encoder không phản hồi |
+| `S15 SERVO_OFF` | Không tắt được servo | Lỗi đang kẹt, hoặc node đã rời OPERATIONAL. Nếu `Disable Operation` không có tác dụng, chương trình ép `Disable Voltage` (`0x0000`) |
 
 ---
 
-## 7. Những điều đã xác minh trên phần cứng thật
+## 11. Đã triển khai và mức độ kiểm chứng
 
-Dưới đây là những gì đã đo được trên một cặp MBDV-2X-520AC thật, và cách mã nguồn đã thích ứng.
-Các mục này **không** có trong tài liệu, chỉ có trong EDS/Manual hoặc phải đo mới biết.
-
-| # | Phát hiện | Bằng chứng | Xử lý trong mã |
-|---|---|---|---|
-| 1 | **EDS không công bố tên/mã ánh xạ alarm của drive** | Cột "Display content" ở Manual §9.1 được vẽ bằng vector, trích xuất text ra rỗng | `0x603F` (chuẩn CiA 402) và `0x1001` (chuẩn CiA 301) được giải mã đầy đủ. `0x200F` chỉ in ra **mã dạng LED `rNN`** để đối chiếu với LED và danh mục §9.1 — **không** bịa ánh xạ |
-| 2 | **`0x2021` trả về tốc độ theo *kbps*, không phải mã P1-18 CB** | Drive 500 kbps đọc được `500`, trong khi mã P1-18 CB sẽ là `2` | `DecodeBitRateObject()` nhận diện cả hai quy ước; so khớp S08 dùng đơn vị bit/s |
-| 3 | **`0x2030` đọc `241`; đơn vị là 0,1 V và 24,1 V là hợp lệ** | `241 × 0,1 = 24,1 V`. **Manual §4.3: nguồn chính là `24 ~ 60 VDC` ở `V+/V−` (DC, không phải AC)**, nên ~24 V nằm trong đặc tả. Statusword có bit 4 `Voltage_enabled = 1` (chuẩn CiA 402 = "main voltage present") | **Dùng bit 4 của Statusword làm tín hiệu quyết định**, không đoán ngưỡng từ `0x2030`. Một bản sửa trước đây gọi mọi giá trị < 25 V là "chưa có nguồn" — **đã sai**, vì 24 V là hợp lệ. Chỉ cảnh báo khi bit 4 = 0, hoặc khi `0x2030` lệch khỏi 24–60 VDC |
-| 4 | **`slave_N.bin` trong DCF được phân giải theo CWD của tiến trình, không theo thư mục DCF** | `co_sub_get_download_file()` (lely `src/co/obj.c`) trả về đúng tên file thô trong DCF, không ghép thư mục nào | S01 `chdir()` vào thư mục DCF (và khôi phục lại khi shutdown). Nếu không, SDO download abort với `slave_1.bin: No such file or directory` + abort code `08000020`, biểu hiện thành lỗi S05 **giả** |
-| 5 | **RPDO2/RPDO3 mặc định `0xFE` = "chỉ RTR"** | EDS `0x1401sub2` / `0x1402sub2` mặc định `0xFE`; 2 bit thấp kiểu CiA 301 là `10b` = RTR only | YAML khai báo `transmission: 255`; S09 ghi và **đọc ngược kiểm chứng** |
-| 6 | **`0x6060` bị bỏ qua nếu P1-00 không khớp** | P1-00 nằm ở object hãng `0x2A30`, mặc định `21` | S10 đọc `0x6061` để xác nhận, và nêu rõ giá trị `0x2A30` cần sửa |
-| 7 | **Sảy phân giải đường dẫn cấu hình có thể nạp nhầm file** | Bản đầu tiên khớp theo *tên file*, khiến bản single-axis nạp nhầm DCF 2 trục mà **không báo lỗi** | `ResolveConfigPath()` ưu tiên các ứng viên **giữ nguyên thư mục con**; chỉ khớp theo tên ở phương án cuối |
-| 8 | **Thứ tự hủy đối tượng sai gây segfault khi thoát** | `FiberDriver` destructor dùng fiber executor + `master`; bản đầu hủy `loop_` trước driver | Thứ tự cố định: dừng loop → hủy driver → hủy master → hủy I/O → hủy loop/context |
-| 9 | **`0x2AC0` KHÔNG phải chỉ báo alarm** | Drive khoẻ (`0x200F=0`, `0x1001=0`, `0x603F=0`, không có bit FAULT) vẫn trả `0x2AC0 = 0x04000000`. Giá trị này là **bitmask chọn lọc**, không phải mã lỗi | In nguyên giá trị kèm giải thích; cảnh báo rõ **không** dùng làm chỉ báo lỗi. Nguồn alarm đúng là `0x200F` + `0x1001` |
-| 10 | **`0x2070 = 0` là hợp lệ, và `SW7=0` KHÔNG có nghĩa là 1 Mbps** | Cả 2 node đọc `0x00000000`, tức toàn bộ DIP OFF. Node-ID vẫn là 1 và 2 (đọc đúng từ `0x2020`) ⇒ chúng được đặt bằng **Luna software**. Manual §4.2.2: `SW7=0` ⇒ "tốc độ lấy từ Luna software (mặc định 1 Mbps)", **không phải** "đang chạy 1 Mbps" | `DescribeDipSwitch()` diễn đạt đúng nghĩa ("SW7=OFF → tốc độ lấy từ Luna software"). `0x2021` mới là giá trị đo thực và là thứ được kiểm tra |
-| 11 | **Sub-index của COB-ID là 1, không phải 0** | Viết `0x1401:00` trả SDO abort `0x06010002` ("Attempt to write a read only object") vì `:00` là "highest sub-index supported" (read-only) | Toàn bộ ghi trong S09 dùng `ObjRef(0x1401, 1)`. `Hex()` không còn tiền tố `0x` nên log không còn hiện `0x0x1401` |
-| 12 | **Drive từ chối ghi giá trị `0` vào COB-ID** | `0x1400:01 = 0` được chấp nhận nhưng `0x1401:01 = 0` bị từ chối: SDO abort `0x06090030` ("Invalid value for parameter") | S09 **không bao giờ ghi 0**. Tắt PDO bằng cách ghi COB-ID với bit 31 = 0 (giữ nguyên giá trị COB-ID), bật bằng bit 31 = 1 |
-| 13 | **`--p1-00` phải được áp dụng *bên trong* S08** | Nếu ghi `0x2A30` sau khi bring-up thì S08 đã fail trước đó và không bao giờ tới được bước ghi. Cùng lý do: `LAST GOOD STAGE` phải tính **theo trục đang lỗi** — nếu lấy max toàn cục thì AX1 đạt S11 sẽ làm báo cáo nói AX2 "đã tới S11", gây hiểu nhầm | `write_control_mode` nằm trong `BringUpOptions` và được S08 dùng; `LastSuccessfulStageForAxis()` lọc theo tag trục |
-| 14 | **S12 phải phân biệt "RPDO không tới" với "drive từ chối"** | `telemetry frames` đứng yên (112 → 112) suốt 2 giây chờ S12, trong khi SDO vẫn trả lời bình thường. Gửi cùng một Controlword qua **SDO** phân biệt ngay hai khả năng | `ApplyControlword()` thử RPDO trước (nửa ngân sách thời gian), rồi **fallback sang SDO**, và ghi lại đường đi thành công vào `GetControlwordPath()`. Nếu SDO mà được còn RPDO không ⇒ lỗi nằm ở đường truyền PDO; nếu cả hai đều không ⇒ lỗi nằm bên trong drive |
-| 15 | **`dcf-tools` ghi DCF bị đảo COB-ID RPDO↔TPDO — nhưng SỬA LẠI ĐÃ HỎNG** | EDS đúng: `1400sub1=$NODEID+0x200`, `1800sub1=$NODEID+0x180`. DCF sinh ra bị đảo thành `1400sub1=0x181`, `1800sub1=0x201`. Tuy nhiên khi sửa lại thì tải concise-DCF **thất bại** (`error 74`), `0x2A30` đọc sai, và `0x1600:00` ghi bị từ chối (`0x06010000`) ⇒ **lely cần đúng giá trị như dcf-tools ghi**. Đã **gỡ bản vá**; đây chỉ là ghi nhận, không phải nguyên nhân | Không có hành động — giữ nguyên DCF do `dcfgen` sinh ra |
-| 16 | **KẾT LUẬN: firmware drive BỎ QUA toàn bộ khung RPDO** | Chứng minh theo 3 cách độc lập:<br>① `candump` bắt được master gửi đúng `0x301#0F0088130000` (CW=`0x000F`, Target position=5000)<br>② Drive tự báo cấu hình RPDO1 **hoàn toàn đúng**: `0x1400:01 COB-ID=0201 valid=1`, `0x1400:02=FF (event)`, `0x1600:00=2 → 60400010 60600008`<br>③ Bơm trực tiếp 61 khung `0x201#060000` bằng `cansend`, **không qua master**: Statusword `0x0250` **không đổi một lần** trong 111 khung TPDO1<br>→ Cùng giá trị Controlword ghi qua **SDO** thì chuyển trạng thái **mọi lần**. Lỗi nằm ở firmware drive, không phải master |
-| 17 | **`dcfgen` để lại mọi PDO ở trạng thái *disabled*** | Xác minh bằng `dcfgen -r -v`: lần ghi cuối tới `0x140x:01` / `0x180x:01` là `01 03 00 00` (bit 31 **= 0**) ⇒ PDO bị tắt. Cờ `enabled: true` bị **đảo ngược** | S09 **kiểm tra trước, sửa sau**: (A) đọc ngược ánh xạ; (B) chỉ sửa PDO thực sự sai; (C) **bật lại** 6 PDO đang dùng và tắt RPDO4/TPDO4 (TPDO4 bị bật do cờ đảo) |
+| Chức năng | Trạng thái |
+|---|---|
+| Bring-up S01→S16, kiểm chứng từng giai đoạn | ✅ đã chạy trên phần cứng (2026-10-06) |
+| Kiểm tra và sửa PDO ở S09 | ✅ phần cứng |
+| Tự căn chỉnh P1-00 (không lưu) | ✅ phần cứng (21 → 15) |
+| RPDO dựng tay theo node, phản hồi qua `CanSniffer` | ✅ phần cứng |
+| Động học vi sai, odometry 200 Hz | ✅ phần cứng (`--test-kinematics`) |
+| Dừng hai trục cùng lúc giữa các pha | ✅ phần cứng (2026-10-06) |
+| S15 tắt servo cả hai trục | ✅ phần cứng (2026-10-06) |
+| Report được in và process tự thoát khi có giai đoạn FAIL | ☑️ đã sửa trong code; chưa gặp lại lần chạy có FAIL để kiểm chứng |
+| `--test-velocity` giữ tốc độ cho tới Ctrl+C | ☑️ đã sửa trong code; chưa chạy lại |
+| Teleop bàn phím | ⏳ có trong code; chưa chạy lại trong đợt này |
+| Heartbeat 100/300 ms, stop output, reconnect, phục hồi lỗi | ⏳ có trong code; chưa kiểm chứng trong đợt này |
+| Xuất odometry qua UDP | ⏳ có trong code; chưa kiểm chứng |
 
 ---
 
-## 8. Vài lưu ý kỹ thuật quan trọng
+## 12. Hạn chế và rủi ro đã biết
 
-1. **`OnConfig()` không được bỏ qua.** Bản ghi đè của lely trên `BasicDriver::OnConfig()`
-   mới là nơi khởi động việc tải SDO theo `slave_N.bin`. Driver chỉ **bọc lại** callback hoàn
-   tất để quan sát kết quả, vẫn gọi xuống lớp gốc. Bỏ qua lời gọi này sẽ khiến slave không
-   bao giờ nhận cấu hình.
-2. **S09 là lớp bảo vệ thứ hai, không phải lớp đầu.** Nó không phụ thuộc vào nội dung `.bin`
-   do `dcfgen` sinh ra, nên kể cả khi YAML sai thì vẫn chẩn đoán đúng và nêu đích danh
-   object/sub-index sai.
-3. **Chuỗi cấu hình lại PDO theo CiA 301** là bắt buộc: tắt PDO (xoá bit 31 của
-   `0x140x:01`/`0x180x:01`) → về 0 số phần tử ánh xạ → ghi từng phần tử → đặt transmission
-   type → đặt event timer → bật lại PDO. Làm sai thứ tự này sẽ bị drive từ chối.
-4. **`0x2070` cho biết trạng thái DIP thật.** Chương trình luôn in ra (kể cả khi mọi thứ tốt)
-   để đối chiếu nhanh với jumper thực tế.
-5. **Lỗi `SDO abort code 08000020` ở S05 gần như luôn là lỗi đường dẫn `.bin`**, không phải
-   lỗi DCF/EDS. Kiểm tra dòng S01 ghi "working directory changed to ...".
-6. **Tương thích ngược:** các hàm không theo giai đoạn cũ (`EnableServo()`,
-   `SetTargetPosition()`, `PrintTelemetry()`…) vẫn còn để các ứng dụng khác dùng được.
+1. **Driver lely được tạo trên sai thread (rủi ro cao).** lely yêu cầu *"The driver MUST be
+   instantiated on the thread on which its task are run"*. Ở đây `MbdvAxisDriver` được tạo trên
+   main thread, nhưng task của nó chạy trên event-loop thread.
+   - Hậu quả: biến đếm `pending` trong fiber executor của lely bị hai thread sửa mà không có khoá.
+     Chỉ cần mất một lần cập nhật là trục đó **ngừng nhận lệnh vĩnh viễn**.
+   - Đã xảy ra ngày 2026-10-06, khi thử gửi lệnh từ thêm một thread: AX1 giữ lệnh quay, và vẫn tiếp
+     tục quay vài phút sau khi chương trình đã nhả CAN.
+   - Hướng sửa dự kiến: tạo và huỷ driver trên chính event-loop thread.
+2. **Drive không tự dừng khi mất master.**
+   - Watchdog `0x2060` (P1-39) đang tắt.
+   - Tài liệu chỉ ghi hành động P1-40 nhận giá trị 1–16 (mặc định 1), không có bảng ý nghĩa.
+   - EDS không có `0x6007` hay `0x1016` phía drive.
+
+   Vì vậy, nếu master chết thì drive **giữ setpoint cuối**. Việc cần làm:
+   - tra ý nghĩa các giá trị P1-40 trong Luna;
+   - đặt `drive.watchdog_ms` và `drive.watchdog_action`. Timeout phải dài hơn khoảng trống RPDO dài
+     nhất, hiện khoảng 0,4–0,8 s trong lúc kiểm tra staged;
+   - nối stop output vào E-STOP của drive (mục 8).
+3. **P1-00 không được lưu.** Mỗi lần bật nguồn, drive quay về giá trị lưu trong Luna; S08 sẽ ghi lại.
+4. **`--test-velocity` làm robot quay tại chỗ** cho tới khi Ctrl+C.
+5. Khi tắt chương trình, lely in `warning: io_can_net_fini() invoked with pending operations`. Dòng
+   này vô hại.
+
+---
+
+## 13. Các phát hiện trên phần cứng thật
+
+Những điều dưới đây không có trong tài liệu, hoặc chỉ biết được khi đo trên drive thật. Cột cuối là
+cách code đã xử lý.
+
+| # | Phát hiện | Xử lý trong code |
+|---|---|---|
+| 1 | EDS không công bố bảng tên/mã alarm của `0x200F` | Giải mã đầy đủ `0x603F` và `0x1001` theo chuẩn; `0x200F` chỉ in mã LED `rNN` |
+| 2 | `0x2021` trả tốc độ theo kbps (`500`), không phải mã P1-18 | So sánh S08 theo bit/s, nhận cả hai quy ước |
+| 3 | `0x2030` có đơn vị 0,1 V (đo được 241 → 24,1 V và 482 → 48,2 V) | Dựa vào bit 4 Statusword để quyết định có nguồn chính, không dựa vào ngưỡng điện áp |
+| 4 | lely tìm `slave_N.bin` theo thư mục làm việc hiện tại (CWD), không theo thư mục DCF | S01 `chdir()` vào thư mục DCF, khôi phục khi tắt |
+| 5 | RPDO2/RPDO3 mặc định là `0xFE` (chỉ RTR) | `master.yaml` ghi `0xFF`; S09 đọc ngược |
+| 6 | `0x6060` bị bỏ qua nếu P1-00 không khớp | S08 tự căn chỉnh P1-00; S10 đọc `0x6061` xác nhận |
+| 7 | Tìm file cấu hình chỉ theo tên có thể nạp nhầm file | Ưu tiên ứng viên giữ nguyên thư mục con; khớp theo tên chỉ là phương án cuối |
+| 8 | Huỷ đối tượng sai thứ tự gây segfault khi thoát | Thứ tự cố định: dừng loop → huỷ driver → master → I/O → loop/context |
+| 9 | `0x2AC0` không phải chỉ báo alarm | In nguyên giá trị kèm chú thích |
+| 10 | `0x2070 = 0` là hợp lệ; `SW7 = 0` nghĩa là tốc độ do Luna đặt, không phải 1 Mbps | Mô tả DIP đúng nghĩa; `0x2020`/`0x2021` là nguồn tin cậy |
+| 11 | COB-ID ở sub-index 1; ghi vào `:00` bị abort `0x06010002` | Mọi lần ghi ở S09 dùng `:01` |
+| 12 | Drive từ chối ghi `0` vào COB-ID (abort `0x06090030`) | Tắt/bật PDO bằng bit 31, giữ nguyên COB-ID |
+| 13 | P1-00 phải được xử lý ngay trong S08; "Last OK" phải tính theo từng trục | Ghi P1-00 bên trong S08; `LastSuccessfulStageForAxis()` lọc theo trục |
+| 14 | Cần phân biệt "RPDO không tới" với "drive từ chối" | S12 đọc ngược `0x6040` qua SDO. Controlword chỉ gửi qua RPDO, không fallback sang SDO, để lỗi PDO không bị che |
+| 15 | `master.dcf` gốc của `dcfgen` không mô tả được đường PDO tới drive | `tools/fix_master_dcf.py`, có tự kiểm chứng (kể cả `AccessType = rw`) |
+| 16 | `dcfgen` để mọi PDO ở trạng thái disabled (cờ bit 31 bị đảo) | S09 kiểm tra trước, sửa sau; bật 6 PDO dùng, tắt RPDO4/TPDO4 |
+| 17 | OD dùng chung của master làm hai node nhận lệnh và phản hồi của nhau | RPDO dựng tay theo node; phản hồi qua `CanSniffer` |
+| 18 | *(2026-10-06)* Dừng từng trục một (cách nhau khoảng 400 ms) làm robot tự xoay 0,13–0,22 rad mỗi lần dừng | Gửi setpoint cho cả hai trục trước, sau đó mới kiểm tra lần lượt |
+| 19 | *(2026-10-06)* Lệnh staged không cập nhật `last_target_velocity_`, nên lần gửi lại controlword 20 Hz phát lại setpoint cũ | Lưu setpoint trước khi gửi RPDO3 |
+| 20 | *(2026-10-06)* Gửi lệnh từ thêm một thread làm strand của AX1 chết, AX1 quay vài phút | Đã gỡ bỏ; nguyên nhân gốc ở mục 12, rủi ro 1 |
+| 21 | *(2026-10-06)* Report tự khoá lồng mutex, nên process treo mỗi khi có giai đoạn FAIL | `Print()` in từ bản sao; không gọi hàm khoá khi đang giữ khoá |
+| 22 | *(2026-10-06)* Ở S15, `000F` (RPDO3) và `0007` (RPDO1) gửi sát nhau nên drive giữ `000F`; lệnh `Disable Voltage` khẩn bị hoãn tới sau khi S15 đã FAIL | Chờ giảm tốc xong mới gửi `0007`; lệnh khẩn gửi ngay. S15 PASS cả hai trục |
+| 23 | *(2026-10-06)* Event timer TPDO trong DCF (10/10/100 ms) lệch `params.yaml` (5/5/50 ms), nên S09 nạp lại 3 PDO mỗi lần boot | Đồng bộ `master.yaml` về 5/5/50 ms (chờ kiểm chứng sau build) |
+| 24 | *(2026-10-06)* Ghi `0x1017` của AX1 thất bại vì SDO đang bận nạp DCF | Ghi heartbeat sau S05 (chờ kiểm chứng sau build) |
+
+Ghi chú thêm:
+- `OnConfig()` của driver chỉ bọc callback hoàn tất và vẫn gọi lớp gốc của lely. Bỏ lời gọi đó thì
+  slave không bao giờ nhận cấu hình.
+- S09 là lớp bảo vệ thứ hai: nó không phụ thuộc nội dung `.bin`, nên vẫn chỉ ra đúng object sai kể
+  cả khi YAML sai.
+
+---
+
+## 14. Cấu trúc thư mục
+
+```text
+driver_Moons_MBDV/
+├── CMakeLists.txt
+├── README.md
+├── odometry_kinematics_summary.md     # ghi chú động học vi sai và odometry
+├── config/
+│   ├── CANOPEN-EDS-MBDV-Servo-DulAxes-V1.0.eds
+│   ├── master.yaml                    # đầu vào dcfgen lúc BUILD
+│   ├── params.yaml                    # cấu hình RUNTIME
+│   ├── master.dcf                     # sinh bởi dcfgen + tools/fix_master_dcf.py
+│   └── slave_1.bin, slave_2.bin       # sinh bởi dcfgen, nạp vào drive lúc boot
+├── docx/                              # tài liệu gốc (EDS, manual) + tài liệu liveness
+├── include/mbdv/
+│   ├── can_sniffer.hpp                # socket chỉ nghe, giải mã TPDO theo node
+│   ├── cia402_defs.hpp                # enum + giải mã trạng thái CiA 402
+│   ├── config_path.hpp                # tìm file cấu hình từ mọi thư mục
+│   ├── diagnostics.hpp                # Stage, Logger, DiagnosticReport
+│   ├── diff_drive_kinematics.hpp      # động học vi sai
+│   ├── drive_errors.hpp               # chỉ số OD + giải mã lỗi theo EDS
+│   ├── dual_axis_controller.hpp       # điều phối 2 trục, supervisor, vòng 200 Hz
+│   ├── mbdv_axis_driver.hpp           # driver một trục (FiberDriver), stage S05..S15
+│   ├── odometry_publisher.hpp         # xuất odometry (callback / UDP)
+│   └── params.hpp                     # đọc config/params.yaml
+├── src/                               # phần cài đặt tương ứng + main.cpp
+└── tools/
+    ├── fix_master_dcf.py              # sửa + tự kiểm chứng master.dcf
+    ├── verify_run.sh                  # chứng minh PDO chạy thật trên bus
+    └── make_docx.py                   # sinh docx/MBDV-dual-axis-liveness-and-recovery.docx
+```
+
+---
+
+## 15. Tài liệu tham khảo
+
+| Tài liệu | Dùng cho |
+|---|---|
+| `docx/CANOPEN-EDS-MBDV-Servo-DulAxes-V1.0.eds` (+ `.md`) | Object Dictionary, PDO mặc định, object hãng (`0x200F`, `0x2020`, `0x2021`, `0x2060`, `0x2070`, `0x2A30`…) |
+| `docx/MBDV-Hardware-Manual-EN20230926-MOONS.pdf` (+ `.md`) | §4.2.2 DIP, §4.3 nguồn, §4.11 STO, §6 commissioning, §8 tham số (P1-00, P1-39, P1-40…), §9.1 alarm |
+| `docx/MBDV-2X-520AC.pdf` | Bản vẽ kích thước |
+| `docx/MBDV-dual-axis-liveness-and-recovery.md` / `.docx` | Heartbeat, reconnect, phục hồi lỗi, 200 Hz |
+| `odometry_kinematics_summary.md` | Động học vi sai và odometry |

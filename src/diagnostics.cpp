@@ -406,16 +406,19 @@ Stage DiagnosticReport::LastSuccessfulStage() const {
 }
 
 Stage DiagnosticReport::LastSuccessfulStageForAxis(const char* axis) const {
-  std::lock_guard<std::mutex> lock(mutex_);
   const std::string key = axis ? axis : "";
   Stage best = Stage::NONE;
-  for (const StageOutcome& outcome : outcomes_) {
-    if (outcome.status == StageStatus::PASS && outcome.axis == key &&
-        stage_index(outcome.stage) > stage_index(best)) {
-      best = outcome.stage;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const StageOutcome& outcome : outcomes_) {
+      if (outcome.status == StageStatus::PASS && outcome.axis == key &&
+          stage_index(outcome.stage) > stage_index(best)) {
+        best = outcome.stage;
+      }
     }
   }
   if (best != Stage::NONE) return best;
+  // Outside the lock: LastSuccessfulStage() takes the same non-recursive mutex.
   return LastSuccessfulStage();
 }
 
@@ -437,7 +440,6 @@ void DiagnosticReport::PrintFirstFailure(std::ostream& os) const {
      << '\n'
      << "  Purpose    : " << stage_purpose(failure->stage) << '\n'
      << "  Axis       : " << (failure->axis.empty() ? "(bus-global)" : failure->axis) << '\n'
-     << "  Elapsed    : " << failure->elapsed.count() << " ms\n"
      << "  Reason     : " << failure->reason << '\n';
   if (!failure->hint.empty()) {
     os << "  Hint       : " << failure->hint << '\n';
@@ -453,9 +455,16 @@ void DiagnosticReport::PrintFirstFailure(std::ostream& os) const {
 }
 
 bool DiagnosticReport::Print(std::ostream& os, const std::string& title) const {
-  std::lock_guard<std::mutex> lock(mutex_);
+  // Formats a copy: LastSuccessfulStageForAxis() below takes the same non-recursive mutex,
+  // so holding it here deadlocked every report with a FAIL in it - the process hung after
+  // S16 and the report never appeared.
+  std::vector<StageOutcome> outcomes;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    outcomes = outcomes_;
+  }
   const StageOutcome* failure = nullptr;
-  for (const StageOutcome& outcome : outcomes_) {
+  for (const StageOutcome& outcome : outcomes) {
     if (outcome.status == StageStatus::FAIL) {
       failure = &outcome;
       break;
@@ -470,19 +479,15 @@ bool DiagnosticReport::Print(std::ostream& os, const std::string& title) const {
   os << '\n' << std::string(rule, '=') << '\n'
      << "  " << title << " : " << verdict << '\n'
      << std::string(rule, '=') << '\n'
-     << "  Stage  Name            Axis   Result  Elapsed   Reason"
-     << '\n'
+     << "  " << std::left << std::setw(6) << "Stage" << std::setw(14) << "Name" << std::setw(7)
+     << "Axis" << std::setw(8) << "Result" << "Reason" << '\n'
      << "  " << std::string(rule - 2, '-') << '\n';
 
-  for (const StageOutcome& outcome : outcomes_) {
-    const std::string elapsed =
-        outcome.status == StageStatus::PENDING ? std::string("-")
-                                               : Str(outcome.elapsed.count(), "ms");
+  for (const StageOutcome& outcome : outcomes) {
     os << "  " << std::left << std::setw(6) << stage_code(outcome.stage) << std::setw(14)
        << stage_name(outcome.stage) << std::setw(7)
        << (outcome.axis.empty() ? "-" : outcome.axis) << std::setw(8)
-       << stage_status_tag(outcome.status) << std::setw(10) << elapsed << ' '
-       << Ellipsize(outcome.reason, 44) << '\n';
+       << stage_status_tag(outcome.status) << Ellipsize(outcome.reason, 54) << '\n';
   }
 
   if (failure) {

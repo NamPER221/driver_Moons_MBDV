@@ -81,7 +81,7 @@ std::vector<std::string> ConfigPathCandidates(const std::string& path) {
   const std::string exe_parent = exe_dir.empty() ? std::string() : Join(exe_dir, "..");
 
   // 2. relative to the project root baked in at build time - this keeps the
-  //    sub-directory the user typed (config/single_axis_500k/... stays distinct).
+  //    sub-directory the user typed (config/<other>/... stays distinct).
 #ifdef MBDV_PROJECT_DIR
   if (!IsAbsolute(path)) {
     candidates.push_back(Join(MBDV_PROJECT_DIR, path));
